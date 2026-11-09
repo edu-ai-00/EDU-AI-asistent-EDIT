@@ -1,0 +1,622 @@
+<script lang="ts">
+	/**
+	 * One card: a block and its steps.
+	 *
+	 * The editor column holds exactly one of these — the card selected in the tree —
+	 * so everything here is open. There is nothing to expand and no summary line,
+	 * because a card that is on screen is a card being worked on.
+	 *
+	 * What is *not* here is the card's configuration: length, practice enrolment, the
+	 * knowledge vector, the machinery. That is one click away in `CardSettings`. The
+	 * card-wide hint and help are there too: they are only the fallback for steps
+	 * that have none of their own, so the steps' ladders stay here and the card's
+	 * sits with the rest of its settings.
+	 */
+	import {
+		dragHandleZone,
+		SHADOW_ITEM_MARKER_PROPERTY_NAME,
+		SHADOW_PLACEHOLDER_ITEM_ID,
+		type DndEvent
+	} from 'svelte-dnd-action';
+	import { tick } from 'svelte';
+	import type {
+		BlockStep,
+		BlockV2,
+		CourseV2,
+		LessonBlockBinding,
+		StepType
+	} from '$lib/domain/schema';
+	import Card from '$lib/ui/Card.svelte';
+	import Chip from '$lib/ui/Chip.svelte';
+	import Button from '$lib/ui/Button.svelte';
+	import Modal from '$lib/ui/Modal.svelte';
+	import Menu from '$lib/ui/Menu.svelte';
+	import MenuItem from '$lib/ui/MenuItem.svelte';
+	import MenuSeparator from '$lib/ui/MenuSeparator.svelte';
+	import { notices } from '$lib/state/notice.svelte';
+	import type { Ref } from '$lib/domain/ref';
+	import FocusField from '$lib/ui/FocusField.svelte';
+	import StepEditor from './StepEditor.svelte';
+	import { useStepView, useStore } from '$lib/ui/context';
+	import { uniqueKeys } from '$lib/ui/keys';
+	import { counted } from '$lib/ui/plural';
+	import { cardSettingsSummary } from '$lib/ui/fields';
+	import {
+		addStep,
+		bindBlock,
+		moveBlockInLesson,
+		reorderSteps,
+		setField
+	} from '$lib/domain/commands';
+	import { lessonLabel } from '$lib/domain/naming';
+	import { cardActions } from './card-actions';
+	import { checksQuestionsInOneTap, keepsQuestionsTogether } from '$lib/domain/groups';
+	import {
+		blockDurationMinutes,
+		derivedBlockXp,
+		bindingFlagsPractice,
+		isPracticeBlock
+	} from '$lib/domain/derive';
+	import {
+		ArrowDown,
+		ArrowUp,
+		Copy,
+		Ellipsis,
+		ListPlus,
+		ListX,
+		Plus,
+		Settings,
+		Square,
+		SquareCheck,
+		Trash
+	} from '@lucide/svelte';
+	import { STEP_TYPES } from '$lib/lang';
+	import { focusAdded, focusSelectedCard } from '$lib/ui/focus-after';
+	import { cardTypeChipTitle, cardTypeIcon, cardTypeLabel } from '$lib/ui/card-types';
+
+	interface Props {
+		doc: CourseV2;
+		block: BlockV2;
+		/** Absent for a card bound to no lesson — it is editable, just unreachable. */
+		binding?: LessonBlockBinding;
+		lessonId?: string;
+		onsettings: () => void;
+		onrepairBlock: (blockId: string) => void;
+		onrepairStep: (blockId: string, stepId: string) => void;
+	}
+	let { doc, block, binding, lessonId, onsettings, onrepairBlock, onrepairStep }: Props = $props();
+
+	const store = useStore();
+	// The same actions the rail and the tree call (`card-actions.ts`).
+	const actions = cardActions(store, {
+		onsettings: () => onsettings(),
+		onrepair: (blockId) => onrepairBlock(blockId)
+	});
+	const boundLessons = $derived(
+		doc.lessons.filter((lesson) =>
+			lesson.blocks.some((binding) => binding.block_id === block.block_id)
+		)
+	);
+	const sharedWith = $derived(boundLessons.length);
+	const availableLessons = $derived(
+		doc.lessons.filter(
+			(lesson) => !lesson.blocks.some((binding) => binding.block_id === block.block_id)
+		)
+	);
+	let showLessonPicker = $state(false);
+	let targetLessonId = $state('');
+	const xp = $derived(derivedBlockXp(block));
+	const minutes = $derived(blockDurationMinutes(block));
+
+	const set = (field: string, value: unknown) =>
+		store.apply((d) => setField(d, { blockId: block.block_id, field }, value));
+
+	/**
+	 * What a step does to the student depends on the card it is in, and that is the
+	 * one thing the two "Otázka" affordances never said. From
+	 * `block_step_engine.dart`: a `display` card draws one step per bubble and only
+	 * as far as `_currentStepIndex`, so a step is a stop the student taps through;
+	 * a `question` or `exercise` card draws `_buildExerciseCard()` — one bubble with
+	 * every step in it from the start, its questions live — and runs
+	 * `_skipToNextQuestion()` on mount and after every
+	 * answer, so content steps are passive context and the student starts at the
+	 * question. Branching (`go_to`) is honoured for `question` and ignored for
+	 * `exercise` (`step_navigation.dart`).
+	 *
+	 * A further question is a card of its own for the pupil, unless the card keeps
+	 * its questions together (`domain/groups.ts`): then they are all in one bubble,
+	 * and without an open one they are checked in one tap, branching between them
+	 * unused (`checksQuestionsInOneTap`).
+	 *
+	 * So the same question is a pause inside a reading in one case and the whole
+	 * point of the card in the other — which is the choice a teacher is making here
+	 * without being told.
+	 */
+	const CONTENT_STEP_TITLE = $derived(
+		block.type === 'display'
+			? 'Samostatná zastávka: žák uvidí tenhle krok, klikne Pokračovat a teprve pak se objeví další.'
+			: 'V téhle kartě není obsahový krok zastávka — zobrazí se v jedné bublině spolu s otázkou jako její zadání a žák jde rovnou odpovídat. Když se má žák zastavit a číst, patří text do karty typu Výklad.'
+	);
+	const stepTitle = (type: StepType) =>
+		type !== 'question'
+			? CONTENT_STEP_TITLE
+			: block.type === 'display'
+				? 'Otázka uvnitř výkladu: žák si přečte kroky nad ní, odpoví, a teprve pak se mu ukáže další krok. Slouží ke kontrole čtení. Má-li odpověď rozhodnout, co bude dál, udělej z otázky vlastní kartu typu Otázka — celou ji pak žák vidí jako jednu otázku a podle odpovědi ho lze poslat jinam.'
+				: keepsQuestionsTogether(block)
+					? checksQuestionsInOneTap(block)
+						? 'Další otázka v téže bublině. Žák vidí všechny otázky naráz a zkontroluje je jedním tlačítkem; větvení mezi nimi se nepoužije.'
+						: 'Další otázka v téže bublině. Žák vidí všechny otázky naráz a odpovídá na ně postupně.'
+					: block.type === 'exercise'
+						? 'Další úloha. Žák ji dostane jako samostatnou kartu, až odpoví na předchozí; větvení se v kartě typu Cvičení ignoruje. Mají-li být úlohy pohromadě, zapni v nabídce ⋯ „Všechny otázky v jedné kartě“.'
+						: 'Další otázka. Žák ji dostane jako samostatnou kartu, až odpoví na předchozí, nebo tam, kam ho pošle větvení. Mají-li být otázky pohromadě, zapni v nabídce ⋯ „Všechny otázky v jedné kartě“.';
+
+	/**
+	 * Open the card's settings when something outside the editor points at the
+	 * card's own hint or help — the question mark in the preview, or a validation
+	 * jump. Those two fields live in `CardSettings` now, and a card-level ref has no
+	 * `stepId`, so `StepEditor`'s reveal never matches it; without this the "?"
+	 * would report the right field and the screen would do nothing. The dialog opens
+	 * the fold that holds the field by itself (`sectionTargeted`).
+	 */
+	const revealedField = $derived(
+		store.selection?.blockId === block?.block_id && store.selection?.stepId === undefined
+			? store.selection?.field
+			: undefined
+	);
+	$effect(() => {
+		// The reveal counter, not the selection: typing also moves the selection.
+		void store.reveal;
+		if (revealedField === 'hint' || revealedField === 'help') onsettings();
+	});
+
+	/**
+	 * The list `svelte-dnd-action` reorders. Each item carries a key that is unique
+	 * even when the document holds duplicate step ids, and the step itself.
+	 */
+	interface StepItem {
+		id: string;
+		step: BlockStep;
+		[SHADOW_ITEM_MARKER_PROPERTY_NAME]?: boolean;
+	}
+	const stepView = useStepView();
+	const baseItems = $derived.by((): StepItem[] => {
+		const keys = uniqueKeys(block.steps.map((s) => s.id));
+		return block.steps.map((step, i) => ({ id: keys[i], step }));
+	});
+	let dragging = $state<StepItem[] | null>(null);
+	const items = $derived(dragging ?? baseItems);
+	/** The key of the step being carried — the placeholder has another id at first. */
+	let carried = $state<string | null>(null);
+	const keyOf = (item: StepItem) =>
+		item[SHADOW_ITEM_MARKER_PROPERTY_NAME] &&
+		item.id === SHADOW_PLACEHOLDER_ITEM_ID &&
+		carried !== null
+			? carried
+			: item.id;
+
+	/**
+	 * A press on a step's handle, before the library has measured anything: fold
+	 * every step now, so the list it measures — and the gap it leaves for the
+	 * carried step — is the short one. The library records the pointer where it was
+	 * pressed, but builds the clone from the handle's rect at the first move, so the
+	 * handle has to end up where it was pressed, or the step stays offset from the
+	 * pointer for the whole drag (and the drop follows the clone, not the pointer).
+	 *
+	 * Folding moves the handle up by whatever the folded steps above it gave back.
+	 * The column is scrolled by the same amount, with three things done first:
+	 *  - the scrolling column is found before the fold, while it still overflows;
+	 *  - the list is pinned to its height, so the column keeps its scroll height and
+	 *    the browser cannot clamp `scrollTop` down under a shorter list;
+	 *  - whatever the scroll could not give back (`scrollTop` cannot go below 0) is
+	 *    padded on top of the list. That gap is cleared on drop, or on release.
+	 */
+	async function grab(handle: HTMLElement) {
+		if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+		const zone = handle.closest<HTMLElement>('.steps');
+		const scroller = scrollParent(handle);
+		const before = handle.getBoundingClientRect().top;
+		if (zone !== null) {
+			zone.style.minHeight = `${zone.getBoundingClientRect().height}px`;
+			zone.style.paddingTop = '';
+		}
+		stepView.dragging = true;
+		await tick();
+		const shift = handle.getBoundingClientRect().top - before;
+		if (shift !== 0) scroller?.scrollBy({ top: shift, behavior: 'instant' });
+		const rest = handle.getBoundingClientRect().top - before;
+		if (rest < -0.5 && zone !== null) zone.style.paddingTop = `${-rest}px`;
+		zoneOf = zone;
+		// A press that never became a drag gets no `finalize`.
+		const release = () => {
+			window.removeEventListener('pointerup', release);
+			window.removeEventListener('keyup', release);
+			if (dragging === null) {
+				stepView.dragging = false;
+				unpinSteps();
+			}
+		};
+		window.addEventListener('pointerup', release);
+		window.addEventListener('keyup', release);
+	}
+
+	/** The list `grab` pinned and padded, until the drop or release clears it. */
+	let zoneOf: HTMLElement | null = null;
+	function unpinSteps() {
+		zoneOf?.style.removeProperty('min-height');
+		zoneOf?.style.removeProperty('padding-top');
+		zoneOf = null;
+	}
+
+	function scrollParent(node: HTMLElement): HTMLElement | null {
+		for (let el = node.parentElement; el !== null; el = el.parentElement) {
+			const overflow = getComputedStyle(el).overflowY;
+			if ((overflow === 'auto' || overflow === 'scroll') && el.scrollHeight > el.clientHeight)
+				return el;
+		}
+		return document.scrollingElement as HTMLElement | null;
+	}
+
+	function onconsider(event: CustomEvent<DndEvent<StepItem>>) {
+		carried = event.detail.info.id;
+		dragging = event.detail.items;
+	}
+
+	function onfinalize(event: CustomEvent<DndEvent<StepItem>>) {
+		dragging = null;
+		carried = null;
+		stepView.dragging = false;
+		// After the library's own unlock, which put the pinned min-height back.
+		unpinSteps();
+		store.apply((d) =>
+			reorderSteps(
+				d,
+				block.block_id,
+				event.detail.items.map((item) => item.step.id)
+			)
+		);
+	}
+
+	/** The card's place among its lesson's cards; -1 when it is opened outside a lesson. */
+	const place = $derived(
+		lessonId === undefined
+			? -1
+			: (doc.lessons
+					.find((l) => l.lesson_id === lessonId)
+					?.blocks.findIndex((b) => b.block_id === block.block_id) ?? -1)
+	);
+	const lessonCards = $derived(
+		doc.lessons.find((l) => l.lesson_id === lessonId)?.blocks.length ?? 0
+	);
+
+	/** „Všechny otázky v jedné kartě“, offered where the rail and the tree offer it. */
+	const together = $derived(actions.together(block));
+
+	function moveCard(delta: -1 | 1) {
+		if (lessonId === undefined) return;
+		const id = lessonId;
+		store.apply((d) => moveBlockInLesson(d, id, block.block_id, delta));
+	}
+
+	function showNotice(message: string, ref: Ref) {
+		const entry = store.undoStack.at(-1);
+		if (entry !== undefined) notices.show({ text: message, entry, ref });
+	}
+
+	function assignToLesson() {
+		if (!availableLessons.some((lesson) => lesson.lesson_id === targetLessonId)) return;
+		const blockId = block.block_id;
+		const name = lessonLabel(
+			doc,
+			availableLessons.find((lesson) => lesson.lesson_id === targetLessonId)!
+		);
+		store.apply((d) => bindBlock(d, targetLessonId, blockId));
+		showLessonPicker = false;
+		showNotice(`Karta zařazena do lekce „${name}“.`, { blockId });
+	}
+
+	let stepsEl = $state<HTMLElement | null>(null);
+	const STEPS = ':scope > .step-wrap';
+</script>
+
+{#snippet stepItems(at: number | undefined)}
+	{#each STEP_TYPES as option (option.type)}
+		<MenuItem
+			icon={option.icon}
+			title={stepTitle(option.type)}
+			onclick={() => {
+				const index = at ?? block.steps.length;
+				store.apply((d, r) => addStep(d, block.block_id, option.type, at, r));
+				void focusAdded(stepsEl, STEPS, index);
+			}}
+		>
+			{option.label}
+		</MenuItem>
+	{/each}
+{/snippet}
+
+<Card tone={binding?.bg_color}>
+	<header>
+		<Chip tone="accent" title={cardTypeChipTitle(block.type)}>
+			{@const Icon = cardTypeIcon(block.type)}
+			<Icon size={16}></Icon>
+			{cardTypeLabel(block.type)}
+		</Chip>
+
+		{#if isPracticeBlock(block, bindingFlagsPractice(doc, block.block_id))}
+			<!--
+				This chip is the practice queue, not the card's type — and on a card of
+				type Cvičení the two chips sat next to each other reading the same word.
+			-->
+			<Chip
+				tone="quiet"
+				title="Karta je zařazená do denního opakování — žák ji dostane znovu podle plánu opakování. S typem karty to nesouvisí; zapíná se v Nastavení karty."
+			>
+				Opakování
+			</Chip>
+		{/if}
+		{#if sharedWith > 1}
+			<Chip tone="warning" title="Karta je i v jiné lekci — úprava se projeví všude">
+				Sdílený: {counted(sharedWith, 'lekce', 'lekce', 'lekcí')}
+			</Chip>
+		{/if}
+		<!--
+            A card without a length is not a mistake: the app then estimates the
+            lesson at about four minutes a card, so there is nothing to say until a
+            teacher sets one. It was a warning on every new card, and then a chip
+            saying "délka odhadem" on every card. The one case that does mislead a
+            student — some cards of a lesson with a length and some without — is
+            W_PARTIAL_DURATION, and it is said where the rest of the review is.
+        -->
+		{#if minutes !== undefined}
+			<Chip tone="quiet" title="Očekávaný čas na kartu">
+				{minutes} min
+			</Chip>
+		{/if}
+
+		<div class="spacer"></div>
+
+		<Chip
+			tone="quiet"
+			title={`Nejvýš ${xp} XP: 8 XP za každou otázku zodpovězenou správně za plný počet bodů (jinak 5), 1 XP za obsahový krok. Platí hned, i když je karta ještě rozepsaná.`}
+		>
+			{xp} XP
+		</Chip>
+
+		<!--
+			Always visible, the same quiet icon in every mode, and its tooltip says what is
+			behind it. A settings button that only appears on hover is a setting nobody
+			finds; a text button in two of three modes is a weight the card carries for
+			one click now and then.
+		-->
+		<Button
+			variant="ghost"
+			size="s"
+			onclick={onsettings}
+			ariaLabel="Nastavení karty"
+			title={cardSettingsSummary(store.mode, store.showFeedback)}
+		>
+			<Settings size={16}></Settings>
+		</Button>
+		<Menu label="Další akce s kartou" icon={Ellipsis} placement="bottom-end">
+			<MenuItem icon={Copy} onclick={() => actions.duplicate(block.block_id, lessonId)}>
+				Duplikovat kartu
+			</MenuItem>
+			{#if together !== undefined}
+				<MenuItem
+					icon={together.on ? SquareCheck : Square}
+					checked={together.on}
+					onclick={() => actions.toggleTogether(block, lessonId)}
+					title="Žák dostane otázky pohromadě a zkontroluje je jedním tlačítkem. Karta se hodnotí podílem správných odpovědí. Vypnuto je každá otázka pro žáka samostatná karta."
+				>
+					Všechny otázky v jedné kartě
+				</MenuItem>
+			{/if}
+			{#if sharedWith === 0}
+				<MenuItem
+					icon={ListPlus}
+					onclick={() => {
+						targetLessonId = '';
+						showLessonPicker = true;
+					}}
+					disabled={availableLessons.length === 0}
+					title={availableLessons.length === 0
+						? 'Nejprve vytvoř lekci'
+						: 'Zařadit existující kartu do lekce bez kopírování obsahu'}
+				>
+					Zařadit do lekce
+				</MenuItem>
+			{:else if binding !== undefined && lessonId !== undefined}
+				<!-- Neutral, not red: it is undoable, and the content stays. -->
+				<MenuItem
+					icon={ListX}
+					onclick={() =>
+						actions.removeFromLesson(lessonId, block.block_id, {
+							follow: true
+						})}
+					title={sharedWith > 1
+						? 'Odebere kartu jen z této lekce — ostatní lekce a všechen obsah zůstanou'
+						: 'Odebere kartu z této lekce. Obsah zůstává v části Karty mimo lekci; smazat jde přes Smazat kartu.'}
+				>
+					Odebrat z lekce
+				</MenuItem>
+			{/if}
+			{#if place >= 0}
+				<MenuItem icon={ArrowUp} onclick={() => moveCard(-1)} disabled={place === 0}>
+					Posunout nahoru
+				</MenuItem>
+				<MenuItem icon={ArrowDown} onclick={() => moveCard(1)} disabled={place >= lessonCards - 1}>
+					Posunout dolů
+				</MenuItem>
+			{/if}
+			<MenuSeparator />
+			<MenuItem
+				icon={Trash}
+				danger
+				onclick={() => {
+					if (actions.remove(block.block_id, lessonId)) void focusSelectedCard();
+				}}
+				title="Smaže kartu z celého kurzu; jde vrátit zpět. Míří-li na ni odkaz odjinud, nejdřív se zeptá, kam má vést."
+			>
+				Smazat kartu
+			</MenuItem>
+		</Menu>
+	</header>
+
+	<div
+		class="steps"
+		bind:this={stepsEl}
+		use:dragHandleZone={{
+			items,
+			flipDurationMs: 150,
+			dropTargetStyle: {}
+		}}
+		{onconsider}
+		{onfinalize}
+	>
+		{#each items as item, i (item.id)}
+			<div class="step-wrap" data-step-id={item.step.id}>
+				<StepEditor
+					{doc}
+					{block}
+					step={item.step}
+					stepKey={keyOf(item)}
+					{lessonId}
+					position={i + 1}
+					ongrab={grab}
+					onrepair={onrepairStep}
+				/>
+				<!--
+                    Inside the dnd item, never beside it: every direct child of the zone
+                    is a drag item. It stays a tab stop — the menu at the foot only adds
+                    at the end, and without this a keyboard has no way to insert between.
+                -->
+				{#if i < items.length - 1 && !stepView.dragging}
+					<Menu
+						label="Vložit krok za krok {i + 1}"
+						icon={Plus}
+						class="insert"
+						title="Vložit krok sem"
+					>
+						{@render stepItems(i + 1)}
+					</Menu>
+				{/if}
+			</div>
+		{/each}
+	</div>
+
+	<div class="add-step">
+		<Menu
+			label="Přidat krok"
+			text="Přidat krok"
+			icon={Plus}
+			variant={block.steps.length === 0 ? 'secondary' : 'ghost'}
+		>
+			{@render stepItems(undefined)}
+		</Menu>
+	</div>
+</Card>
+
+{#if showLessonPicker}
+	<Modal title="Zařadit do lekce" onclose={() => (showLessonPicker = false)}>
+		<p>Vyber lekci pro tuto kartu. Její obsah se nebude kopírovat.</p>
+		<label class="lesson-picker">
+			Lekce
+			<select bind:value={targetLessonId}>
+				<option value="" disabled>Vyber lekci…</option>
+				{#each availableLessons as lesson (lesson.lesson_id)}
+					<option value={lesson.lesson_id}>{lessonLabel(doc, lesson)}</option>
+				{/each}
+			</select>
+		</label>
+		{#snippet footer()}
+			<Button variant="ghost" onclick={() => (showLessonPicker = false)}>Zpět</Button>
+			<Button
+				disabled={!availableLessons.some((lesson) => lesson.lesson_id === targetLessonId)}
+				onclick={assignToLesson}>Zařadit</Button
+			>
+		{/snippet}
+	</Modal>
+{/if}
+
+<style>
+	.lesson-picker {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.lesson-picker select {
+		padding: 8px;
+		border: 1px solid var(--e-border);
+		border-radius: var(--radius-s);
+		background: var(--surface);
+		color: var(--e-text);
+		font: inherit;
+	}
+
+	header {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px;
+		margin-bottom: 12px;
+	}
+
+	.spacer {
+		flex: 1;
+	}
+
+	.steps {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+		margin-top: 12px;
+	}
+
+	.step-wrap {
+		position: relative;
+	}
+
+	.step-wrap:focus {
+		outline: none;
+	}
+
+	/*
+     * The insert-between button straddles the gap under a step, out of sight until
+     * the step is pointed at or focused. A screen with no hover shows it always.
+     */
+	.step-wrap :global(.insert) {
+		position: absolute;
+		bottom: -16px;
+		left: 50%;
+		z-index: 1;
+		transform: translateX(-50%);
+		opacity: 0;
+		transition: opacity 120ms;
+	}
+
+	.step-wrap :global(.insert .menu-trigger) {
+		padding: 2px;
+		border-color: var(--e-border-strong);
+		background: var(--surface);
+	}
+
+	.step-wrap:hover :global(.insert),
+	.step-wrap:focus-within :global(.insert) {
+		opacity: 1;
+	}
+
+	@media (hover: none) {
+		.step-wrap :global(.insert) {
+			opacity: 1;
+		}
+	}
+
+	.add-step {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px;
+		margin-top: 12px;
+	}
+</style>

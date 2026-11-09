@@ -1,0 +1,312 @@
+/**
+ * `blockPreview` is the single rule that names a card — the tree, the card's own
+ * heading and the branch labels the preview is handed all call it, so a change here
+ * renames a card in three places at once. These tests hold the two things that rule
+ * now promises: the author's own title wins when there is one, and nothing about the
+ * name is ever written into the document.
+ */
+import { describe, expect, it } from 'vitest';
+import type { BlockV2, CourseV2 } from '../schema';
+import { buildIndex } from '../index-doc';
+import {
+	blockPreview,
+	derivedBlockName,
+	derivedBlockXp,
+	lessonTotals,
+	mediaFileName,
+	optionOutcomesApply,
+	stepPracticeOffered,
+	stepSummary
+} from '../derive';
+
+const block = (over: Partial<BlockV2> = {}): BlockV2 => ({
+	block_id: 'B1',
+	type: 'display',
+	steps: [],
+	...over
+});
+
+describe('what a card is called', () => {
+	it('uses the first line of its text when the author set no title', () => {
+		const b = block({
+			steps: [
+				{ id: 's1', type: 'text', content: '   ' },
+				{ id: 's2', type: 'text', content: 'Zlomek popisuje část celku.' }
+			]
+		});
+		expect(blockPreview(b)).toBe('Zlomek popisuje část celku.');
+	});
+
+	it('prefers the author’s title over the derived one', () => {
+		const b = block({
+			name: 'Co je zlomek',
+			steps: [{ id: 's1', type: 'text', content: 'Zlomek popisuje část celku.' }]
+		});
+		expect(blockPreview(b)).toBe('Co je zlomek');
+		// The fallback is still available on its own, because the field that edits the
+		// title shows it as the placeholder.
+		expect(derivedBlockName(b)).toBe('Zlomek popisuje část celku.');
+	});
+
+	it('keeps underscores and stars that are part of the author’s words', () => {
+		const name = (content: string) =>
+			derivedBlockName(block({ steps: [{ id: 's1', type: 'text', content }] }));
+		expect(name('snake_case je jméno proměnné')).toBe('snake_case je jméno proměnné');
+		// Typed in the editor, a star is written escaped and stays a star; unescaped,
+		// the app shows a lone `2*3*4` as typed (it sniffs no Markdown there).
+		expect(name('Spočítej 2\\*3\\*4 a pak **tučně**')).toBe('Spočítej 2*3*4 a pak tučně');
+		expect(name('Spočítej 2*3*4')).toBe('Spočítej 2*3*4');
+		expect(name('Použij `print(x)` a _kurzívu_')).toBe('Použij print(x) a kurzívu');
+		expect(name('Řádek **s tučným** a snake_case')).toBe('Řádek s tučným a snake_case');
+	});
+
+	it('names a very long text from its start without reading all of it', () => {
+		const long = `Úvod je **důležitý** a snake_case\n\n${'Další odstavec. '.repeat(3_000)}`;
+		expect(long.length).toBeGreaterThan(40_000);
+		expect(derivedBlockName(block({ steps: [{ id: 's1', type: 'text', content: long }] }))).toBe(
+			'Úvod je důležitý a snake_case'
+		);
+		const oneLine = `Dlouhý ${'slovo '.repeat(9_000)}**tučně**`;
+		expect(oneLine.length).toBeGreaterThan(50_000);
+		expect(
+			derivedBlockName(block({ steps: [{ id: 's1', type: 'text', content: oneLine }] }), 20)
+		).toBe('Dlouhý slovo slovo s…');
+	});
+
+	it('treats an empty or blank title as no title at all', () => {
+		// Nothing should ever write `""` here, but a hand-edited document can carry
+		// one, and a card named "" would be invisible in the tree.
+		const steps = [{ id: 's1', type: 'text' as const, content: 'Text karty' }];
+		expect(blockPreview(block({ name: '', steps }))).toBe('Text karty');
+		expect(blockPreview(block({ name: '   ', steps }))).toBe('Text karty');
+	});
+
+	it('truncates the author’s title to the same budget as the derived one', () => {
+		const long = 'A'.repeat(60);
+		expect(blockPreview(block({ name: long }), 10)).toBe(`${'A'.repeat(10)}…`);
+	});
+
+	it('strips markdown and LaTeX delimiters out of the derived name', () => {
+		const b = block({ steps: [{ id: 's1', type: 'text', content: '## Zlomek $\\frac{a}{b}$' }] });
+		expect(blockPreview(b)).toBe('Zlomek a/b');
+	});
+
+	it('shows an authored title with LaTeX as words, without changing it', () => {
+		const b = block({ name: 'Zlomek \\frac{5}{7}' });
+		expect(blockPreview(b)).toBe('Zlomek 5/7');
+		expect(b.name).toBe('Zlomek \\frac{5}{7}');
+	});
+
+	it('names an empty card by its position in the lesson when it has one', () => {
+		// Three cards added in a row are otherwise all "Karta bez textu".
+		expect(blockPreview(block(), 70, 3)).toBe('Karta 3');
+		expect(blockPreview(block())).toBe('Karta bez textu');
+	});
+
+	it('lets the author’s title win even over the position', () => {
+		expect(blockPreview(block({ name: 'Rozcvička' }), 70, 3)).toBe('Rozcvička');
+	});
+});
+
+describe('a card name is the author’s sentence, not a stripped one', () => {
+	const card = (content: string) =>
+		({
+			export_type: 'block_v2',
+			block_id: 'X',
+			version: 1,
+			type: 'display',
+			steps: [{ id: 's1', type: 'text', order: 1, content }]
+		}) as never;
+
+	it('keeps > and # where they are the author’s own characters', () => {
+		// Stripping them everywhere turned "Cena je > 2 Kč" into "Cena je 2 Kč",
+		// which is a different claim, not a shorter one.
+		expect(blockPreview(card('Cena je < 5 Kč a > 2 Kč, hotovo.'))).toBe(
+			'Cena je < 5 Kč a > 2 Kč, hotovo.'
+		);
+		expect(blockPreview(card('Úloha #3 na procvičení'))).toBe('Úloha #3 na procvičení');
+	});
+
+	it('still drops them where they are Markdown', () => {
+		expect(blockPreview(card('# Nadpis karty'))).toBe('Nadpis karty');
+		expect(blockPreview(card('> Citát z učebnice'))).toBe('Citát z učebnice');
+		expect(blockPreview(card('**Tučně** a *kurzívou*'))).toBe('Tučně a kurzívou');
+	});
+
+	it('reads an escaped character as the character the author typed', () => {
+		// The visual editor escapes a typed star so the app does not read it as bold.
+		expect(blockPreview(card('a \\* b je \\$5 a \\#1 *x*'))).toBe('a * b je $5 a #1 x');
+		expect(blockPreview(card('\\# Není nadpis'))).toBe('# Není nadpis');
+	});
+
+	it('names an image or a link by its words, not its address', () => {
+		expect(blockPreview(card('![Kruh](https://example.com/kruh.png) a [web](https://x.cz)'))).toBe(
+			'Kruh a web'
+		);
+	});
+});
+
+describe('a card is named by its opening line', () => {
+	const card = (content: string) =>
+		({
+			export_type: 'block_v2',
+			block_id: 'X',
+			version: 1,
+			type: 'display',
+			steps: [{ id: 's1', type: 'text', order: 1, content }]
+		}) as never;
+
+	it('does not flatten a table into the name', () => {
+		expect(
+			blockPreview(card('Části zlomku\n\n| Pozice | Název |\n|---|---|\n| nahoře | čitatel |'))
+		).toBe('Části zlomku');
+	});
+
+	it('skips blank opening lines rather than giving up', () => {
+		expect(blockPreview(card('\n\n   \nZlomek popisuje část celku.\nDruhý řádek.'))).toBe(
+			'Zlomek popisuje část celku.'
+		);
+	});
+});
+
+describe('a card whose text is one long paragraph', () => {
+	const named = (content: string) =>
+		derivedBlockName(block({ steps: [{ id: 's1', type: 'text', content }] }));
+
+	it('is called by its first sentence', () => {
+		expect(
+			named(
+				'Dnes se naučíme, co je to **fotosyntéza**. Je to proces, při kterém rostliny přeměňují světlo.'
+			)
+		).toBe('Dnes se naučíme, co je to fotosyntéza.');
+	});
+
+	it('does not cut at a decimal point, an ordinal or an abbreviation', () => {
+		expect(named('Číslo 3.5 je větší než tři a půl mínus nic')).toBe(
+			'Číslo 3.5 je větší než tři a půl mínus nic'
+		);
+		expect(named('Viz 1. díl učebnice o zlomcích a desetinných číslech')).toBe(
+			'Viz 1. díl učebnice o zlomcích a desetinných číslech'
+		);
+		expect(named('Voda, tj. H2O, je potřeba pro fotosyntézu')).toBe(
+			'Voda, tj. H2O, je potřeba pro fotosyntézu'
+		);
+	});
+
+	it('keeps a short opening "sentence" together with what follows', () => {
+		// "Úkol 1." is a heading, not a name.
+		expect(named('Úkol 1. Spočítej, kolik je polovina z osmi.')).toBe(
+			'Úkol 1. Spočítej, kolik je polovina z osmi.'
+		);
+	});
+});
+
+describe('the line a folded step shows', () => {
+	it('is the plain text, without Markdown', () => {
+		expect(
+			stepSummary({ id: 's1', type: 'text', content: '## Co je **fotosyntéza**\nDalší řádek' })
+		).toBe('Co je fotosyntéza');
+	});
+
+	it('names a picture by its description, then by its file, never by its address', () => {
+		const url = 'https://upload.wikimedia.org/wikipedia/commons/a/ab/Leaf%201.jpg?width=400';
+		expect(stepSummary({ id: 's1', type: 'image', image: { url, alt: 'List rostliny' } })).toBe(
+			'List rostliny'
+		);
+		expect(stepSummary({ id: 's1', type: 'image', image: { url } })).toBe('Leaf 1.jpg');
+		expect(
+			stepSummary({ id: 's1', type: 'video', video: { url: 'https://example.org/v/intro.mp4' } })
+		).toBe('intro.mp4');
+	});
+
+	it('copes with an address that is still being typed', () => {
+		expect(mediaFileName('')).toBe('');
+		expect(mediaFileName('obrazky/list.png')).toBe('list.png');
+		expect(mediaFileName('https://example.org/')).toBe('example.org');
+		expect(mediaFileName('https://example.org/%E0%A4%A.png')).toBe('%E0%A4%A.png');
+	});
+});
+
+describe('when an answer’s own outcome counts', () => {
+	// The app reads an option's go_to and mark only for a single pick
+	// (block_step_engine.dart, _evaluateStep); the rule is in derive.ts.
+	it('counts for a single pick and a yes/no question', () => {
+		expect(optionOutcomesApply({ type: 'multiple_choice' })).toBe(true);
+		expect(optionOutcomesApply({ type: 'multiple_choice', allow_multiple: false })).toBe(true);
+		expect(optionOutcomesApply({ type: 'true_false' })).toBe(true);
+	});
+
+	it('does not count when the pupil may pick several', () => {
+		expect(optionOutcomesApply({ type: 'multiple_choice', allow_multiple: true })).toBe(false);
+	});
+
+	it('does not count for a question with nothing to pick', () => {
+		expect(optionOutcomesApply({ type: 'open' })).toBe(false);
+		expect(optionOutcomesApply({ type: 'numeric' })).toBe(false);
+	});
+
+	it('leaves a step with no question alone', () => {
+		expect(optionOutcomesApply(undefined)).toBe(true);
+	});
+});
+
+describe('stepPracticeOffered', () => {
+	const step = { id: 's1', type: 'text' as const, content: 'x' };
+	const course = (binding: { default_practice?: boolean } = {}) =>
+		({
+			lessons: [{ lesson_id: 'L1', blocks: [{ block_id: 'B1', ...binding }] }],
+			blocks: []
+		}) as unknown as CourseV2;
+
+	it('is offered when nothing else puts the card in practice', () => {
+		expect(stepPracticeOffered(course(), block({ steps: [step] }), step)).toBe(true);
+	});
+
+	it('is not offered when the card itself is in practice', () => {
+		const b = block({ default_practice: true, steps: [step] });
+		expect(stepPracticeOffered(course(), b, step)).toBe(false);
+	});
+
+	it('is not offered when a lesson binding puts the card in practice', () => {
+		const b = block({ steps: [step] });
+		expect(stepPracticeOffered(course({ default_practice: true }), b, step)).toBe(false);
+	});
+
+	it('stays offered for a step whose own flag is on, so it can be turned off', () => {
+		const on = { ...step, default_practice: true };
+		const b = block({ default_practice: true, steps: [on] });
+		expect(stepPracticeOffered(course({ default_practice: true }), b, on)).toBe(true);
+	});
+});
+
+describe('XP (course_model.dart _calculateBlockMaxXp)', () => {
+	const steps = [
+		{ id: 's1', type: 'text' as const, content: 'a' },
+		{ id: 's2', type: 'question' as const, content: 'b' }
+	];
+	it('is 1 per content step and 8 per question, whatever xp the card says', () => {
+		expect(derivedBlockXp(block({ steps }))).toBe(9);
+		expect(derivedBlockXp(block({ steps, xp: 50 }))).toBe(9);
+		expect(derivedBlockXp(block({ type: 'question' }))).toBe(8);
+		expect(derivedBlockXp(block())).toBe(1);
+	});
+	it('sums a lesson from the steps, an unknown card giving 1', () => {
+		const doc = {
+			export_type: 'course_v2',
+			lessons: [{ lesson_id: 'L', blocks: [{ block_id: 'B1' }, { block_id: 'gone' }] }],
+			blocks: [block({ steps, xp: 50 })]
+		} as unknown as CourseV2;
+		expect(lessonTotals(doc.lessons[0], buildIndex(doc)).xp).toBe(10);
+	});
+});
+
+describe('a plain text stored with a backslash before a list marker (OPEN-PROBLEMS #55)', () => {
+	it.each([
+		['\\- a', '- a'],
+		['\\\\- a', '\\- a'],
+		['\\1. krok\nDruhý řádek', '1. krok'],
+		['a\\-b', 'a\\-b']
+	])('names %j as %j', (content, name) => {
+		expect(stepSummary({ id: 's1', type: 'text', content })).toBe(name);
+	});
+});

@@ -1,0 +1,1060 @@
+/**
+ * Validation — spec §14, implemented as a pure function. No UI in this module.
+ *
+ * Errors block export, warnings never do (§3 invariant 5). The split is exactly the
+ * one §14 draws; nothing here promotes or demotes a rule.
+ *
+ * Messages are Czech and written as consequences for the student, because that is
+ * what makes an author fix them: "žák se nedozví, kde udělal chybu" lands, a field
+ * name does not.
+ *
+ * A message never names a place by its `block_id` / step or option `id` — a teacher
+ * is never shown one (plan §8). `naming.ts` is the one place that turns an id back
+ * into what the teacher actually sees (a card's own text, "Krok 3", an answer's own
+ * text), and every check below goes through it instead of interpolating an id
+ * directly. The one exception is a genuinely id-shaped bug — two things sharing one
+ * id, or a reference to an id nothing carries — where the id itself is what is wrong
+ * and has to stay on screen, alongside a human name so the teacher can find the
+ * place.
+ */
+import { appShowsFeedback } from './course-feedback';
+import { hintOfferedSteps } from './hint-reach';
+import type { BlockStep, BlockV2, CourseV2, QuestionConfig } from './schema';
+import type { Ref } from './ref';
+import { buildIndex, isGoToKeyword, reachableSteps, type DocIndex } from './index-doc';
+import { blockDurationMinutes, isPracticeBlock, optionOutcomesApply } from './derive';
+import { goToIgnored } from './navigation';
+import { mediaHidden, positionField } from './media';
+import { skipConditionSupported } from './practice';
+import {
+	AI_CRITERIA_MAX,
+	GUIDED_ATTEMPTS_MAX,
+	GUIDED_ATTEMPTS_MIN,
+	questionSettingApplies
+} from './question-settings';
+import { dimensionCount, ELO_MAX, ELO_MIN, type SkillConfig } from './skill-config';
+import {
+	blockLabel,
+	capitalize,
+	lessonLabel,
+	optionLabel,
+	stepLabel,
+	stepPosition
+} from './naming';
+import { checksQuestionsInOneTap } from './groups';
+
+export type Severity = 'error' | 'warning';
+
+export interface Issue {
+	code: string;
+	severity: Severity;
+	ref: Ref;
+	message: string;
+}
+
+export interface ValidationResult {
+	errors: Issue[];
+	warnings: Issue[];
+}
+
+/**
+ * The fewest answers a multiple-choice question can have and still leave the pupil
+ * something to choose from (`E_MC_TOO_FEW_OPTIONS`). The answer table disables the
+ * trash of an answer at this number, so its title and this check can never disagree.
+ */
+export const MIN_CHOICE_OPTIONS = 2;
+
+export interface ValidateOptions {
+	/** The last published version, for the "not bumped" warning (§14 warning 1). */
+	lastPublishedVersion?: number;
+}
+
+export function validate(
+	doc: CourseV2,
+	skillConfig?: SkillConfig | null,
+	options: ValidateOptions = {}
+): ValidationResult {
+	const index = buildIndex(doc);
+	const issues: Issue[] = [];
+	const add = (severity: Severity, code: string, ref: Ref, message: string) =>
+		issues.push({ code, severity, ref, message });
+
+	checkUniqueIds(doc, add);
+	checkBindings(doc, index, add);
+	checkBlocks(doc, index, skillConfig, add);
+	checkPrerequisiteGraph(doc, index, add);
+	checkCourseLevel(doc, index, options, add);
+
+	return {
+		errors: issues.filter((i) => i.severity === 'error'),
+		warnings: issues.filter((i) => i.severity === 'warning')
+	};
+}
+
+type Add = (severity: Severity, code: string, ref: Ref, message: string) => void;
+
+// ───────────────────────────── §14.2 referential integrity ─────────────────────────────
+
+function checkUniqueIds(doc: CourseV2, add: Add) {
+	const seenLessons = new Set<string>();
+	for (const lesson of doc.lessons) {
+		if (seenLessons.has(lesson.lesson_id)) {
+			// The first lesson with this id, so both duplicates can be named — the id
+			// is what is actually broken here (§3 invariant "ids are unique"), so it
+			// stays on screen too, next to both human names.
+			const first = doc.lessons.find((l) => l.lesson_id === lesson.lesson_id)!;
+			add(
+				'error',
+				'E_DUPLICATE_LESSON_ID',
+				{ lessonId: lesson.lesson_id, field: 'lesson_id' },
+				`Dvě lekce — „${lessonLabel(doc, first)}“ a „${lessonLabel(doc, lesson)}“ — mají stejné id „${lesson.lesson_id}“. Postup žáka se ukládá pod tímto id, takže by se obě lekce navzájem přepisovaly.`
+			);
+		}
+		seenLessons.add(lesson.lesson_id);
+	}
+
+	const seenBlocks = new Set<string>();
+	for (const block of doc.blocks) {
+		if (seenBlocks.has(block.block_id)) {
+			const first = doc.blocks.find((b) => b.block_id === block.block_id)!;
+			add(
+				'error',
+				'E_DUPLICATE_BLOCK_ID',
+				{ blockId: block.block_id, field: 'block_id' },
+				`Dvě karty — „${blockLabel(doc, first)}“ a „${blockLabel(doc, block)}“ — mají stejné id „${block.block_id}“. Žákovi by se zobrazila jen jedna z nich a odkazy na tu druhou by nikam nevedly.`
+			);
+		}
+		seenBlocks.add(block.block_id);
+
+		const seenSteps = new Set<string>();
+		for (const step of block.steps) {
+			if (seenSteps.has(step.id)) {
+				const first = block.steps.find((s) => s.id === step.id)!;
+				add(
+					'error',
+					'E_DUPLICATE_STEP_ID',
+					{ blockId: block.block_id, stepId: step.id, field: 'id' },
+					`Karta „${blockLabel(doc, block)}“ má dva kroky se stejným id „${step.id}“ — ${stepLabel(block, first)} a ${stepLabel(block, step)}. Odpověď žáka se uloží k jednomu z nich a větvení skočí na nesprávný krok.`
+				);
+			}
+			seenSteps.add(step.id);
+
+			const seenOptions = new Set<string>();
+			for (const option of step.question?.options ?? []) {
+				if (seenOptions.has(option.id)) {
+					const first = (step.question?.options ?? []).find((o) => o.id === option.id)!;
+					add(
+						'error',
+						'E_DUPLICATE_OPTION_ID',
+						{ blockId: block.block_id, stepId: step.id, optionId: option.id, field: 'id' },
+						`V kartě „${blockLabel(doc, block)}“ (${stepLabel(block, step)}) mají dvě odpovědi stejné id „${option.id}“ — ${optionLabel(step.question, first)} a ${optionLabel(step.question, option)}. Žákova volba se může uložit k té druhé a vyhodnotit se jinak, než čekáš.`
+					);
+				}
+				seenOptions.add(option.id);
+			}
+		}
+	}
+}
+
+function checkBindings(doc: CourseV2, index: DocIndex, add: Add) {
+	for (const lesson of doc.lessons) {
+		const lessonName = lessonLabel(doc, lesson);
+
+		for (const binding of lesson.blocks) {
+			if (!index.blocksById.has(binding.block_id)) {
+				// The target itself resolves to nothing this course has, so there is no
+				// human name to give it — the id is the only thing left to point at.
+				add(
+					'error',
+					'E_BINDING_UNRESOLVED',
+					{ lessonId: lesson.lesson_id, blockId: binding.block_id, field: 'block_id' },
+					`Lekce „${lessonName}“ odkazuje na kartu „${binding.block_id}“, která v kurzu není. Žák uvidí lekci kratší, než jsi zamýšlel/a.`
+				);
+			}
+		}
+
+		if (lesson.blocks.length === 0) {
+			// The same idea as W_ORPHAN_BLOCK, one level up. The app still lists the
+			// lesson, and still advertises it at five minutes.
+			add(
+				'warning',
+				'W_EMPTY_LESSON',
+				{ lessonId: lesson.lesson_id },
+				`Lekce „${lessonName}“ nemá žádnou kartu. Žák ji uvidí v kurzu i s odhadem pěti minut, ale po otevření v ní nic nenajde.`
+			);
+		}
+
+		if (lesson.blocks.length > 12) {
+			add(
+				'warning',
+				'W_LESSON_TOO_LONG',
+				{ lessonId: lesson.lesson_id },
+				`Lekce „${lessonName}“ má ${lesson.blocks.length} karet. Žák ji pravděpodobně nedokončí na jeden zátah — zvaž rozdělení.`
+			);
+		}
+
+		// §14 warning 2 — partial duration coverage makes the lesson time wrong.
+		let withDuration = 0;
+		let resolved = 0;
+		for (const binding of lesson.blocks) {
+			const block = index.blocksById.get(binding.block_id);
+			if (block === undefined) continue;
+			resolved++;
+			const minutes = blockDurationMinutes(block);
+			if (minutes !== undefined && minutes > 0) withDuration++;
+		}
+		if (withDuration > 0 && withDuration < resolved) {
+			// No field: a lesson has no length of its own. It is fixed on its cards.
+			add(
+				'warning',
+				'W_PARTIAL_DURATION',
+				{ lessonId: lesson.lesson_id },
+				`V lekci „${lessonName}“ má délku vyplněno jen ${withDuration} z ${resolved} karet. Na kartě lekce se žákovi ukáže součet jen z nich, takže čas bude výrazně nižší než skutečný.`
+			);
+		}
+	}
+}
+
+// ───────────────────────────────── blocks and steps ─────────────────────────────────
+
+function checkBlocks(
+	doc: CourseV2,
+	index: DocIndex,
+	skillConfig: SkillConfig | null | undefined,
+	add: Add
+) {
+	const courseEloMean = meanElo(doc);
+	const graded = appShowsFeedback(doc);
+
+	for (const block of doc.blocks) {
+		const blockRef: Ref = { blockId: block.block_id };
+		const cardName = blockLabel(doc, block);
+
+		checkStructuralCompleteness(doc, block, add);
+		checkVectors(doc, block, skillConfig, add);
+
+		const skip = block.fsrs?.skip_condition;
+		if (typeof skip === 'string' && skip.trim() !== '' && !skipConditionSupported(skip)) {
+			add(
+				'warning',
+				'W_SKIP_CONDITION_UNSUPPORTED',
+				{ ...blockRef, field: 'fsrs.skip_condition' },
+				`Podmínku vynechání karty „${cardName}“ aplikace nepřečte, takže kartu z opakování nikdy nevynechá. Umí jen tvar GPF_mastery > 0.8 (místo > i >=, <, <=, ==, !=).`
+			);
+		}
+
+		if (block.steps.length > 10) {
+			add(
+				'warning',
+				'W_BLOCK_TOO_MANY_STEPS',
+				blockRef,
+				`Karta „${cardName}“ má ${block.steps.length} kroků. Žák ztrácí přehled, kde v ní je — zvaž rozdělení na dvě karty.`
+			);
+		}
+
+		// §14 warning 5 — a block nothing reaches is a block no student ever sees.
+		const referenced = (index.referencesToBlock.get(block.block_id) ?? []).length > 0;
+		if (!referenced && !isPracticeBlock(block)) {
+			add(
+				'warning',
+				'W_ORPHAN_BLOCK',
+				blockRef,
+				`Karta „${cardName}“ není v žádné lekci, nevede na ni žádné větvení ani není zařazena do opakování. Žák se k ní nedostane.`
+			);
+		}
+
+		const reachable = reachableSteps(block);
+		for (const step of block.steps) {
+			const stepRef: Ref = { blockId: block.block_id, stepId: step.id };
+			checkMedia(block, step, add, graded);
+
+			if (!reachable.has(step.id)) {
+				add(
+					'warning',
+					'W_UNREACHABLE_STEP',
+					stepRef,
+					`${capitalize(stepLabel(block, step))} v kartě „${cardName}“ není z ničeho dosažitelný — nevede k němu žádná cesta ani větvení. Žák jej nikdy neuvidí.`
+				);
+			}
+
+			const question = step.question;
+			if (question === undefined) continue;
+
+			checkGoToTargets(index, block, step, question, add);
+			if (graded) checkFeedbackQuality(block, step, question, add);
+			checkIgnoredOutcomes(block, step, question, add);
+		}
+
+		checkEloOutlier(doc, block, courseEloMean, add);
+		checkHintReach(doc, block, add);
+	}
+}
+
+/**
+ * Hint and help that the student's app never shows.
+ *
+ * The app's question mark reads the step on screen: its own hint, else the card's
+ * (`ContentBlock.currentHint`, which `BlockStepEngine` keeps on that step), and help
+ * only as the second rung of a hint that exists. A question or exercise card only
+ * ever stops on its questions; the text between them is context and is never the
+ * step on screen, so its own hint and help are never offered. Its bubble keeps the
+ * "?" once it is finished. When text follows the last question, the engine walks
+ * past the end on the way out, no step is current, and that "?" opens the card's.
+ * Before the engine read each step's own hint (`hintForStep`, editor
+ * `OPEN-PROBLEMS.md` C), only the first step's was read, and this warned about
+ * every other one.
+ */
+function checkHintReach(doc: CourseV2, block: BlockV2, add: Add) {
+	const filled = (text: string | undefined) => (text ?? '').trim() !== '';
+	const cardName = blockLabel(doc, block);
+	const oneBubble = block.type !== 'display';
+	const offered = hintOfferedSteps(block);
+
+	for (const step of block.steps) {
+		const label = capitalize(stepLabel(block, step));
+		if (!offered.includes(step)) {
+			for (const field of ['hint', 'help'] as const) {
+				if (!filled(step[field])) continue;
+				const what = field === 'hint' ? 'nápovědu' : 'podrobnou pomoc';
+				add(
+					'warning',
+					'W_HINT_UNREACHABLE',
+					{ blockId: block.block_id, stepId: step.id, field },
+					`${label} v kartě „${cardName}“ má ${what}, kterou žák neuvidí: v kartě s otázkami se otazník ukazuje jen u otázek (u karty s více otázkami najednou jen u první a poslední), ne u textu mezi nimi. Přesuň ji k otázce, které se týká.`
+				);
+			}
+			continue;
+		}
+		if (filled(step.help) && !filled(step.hint) && !filled(block.hint)) {
+			add(
+				'warning',
+				'W_HINT_UNREACHABLE',
+				{ blockId: block.block_id, stepId: step.id, field: 'help' },
+				`${label} v kartě „${cardName}“ má podrobnou pomoc, kterou žák neuvidí: otevírá se až z nápovědy, a ta u kroku ani u karty není.`
+			);
+		}
+	}
+
+	// Every place a "?" can open: each offered step, and a finished question card
+	// that ended past its last step.
+	const pastEnd =
+		oneBubble && block.steps.length > 0 && block.steps[block.steps.length - 1].type !== 'question';
+	const slots: { hint?: string; help?: string }[] = pastEnd ? [...offered, {}] : offered;
+	if (slots.length === 0) return;
+	if (filled(block.hint) && slots.every((step) => filled(step.hint))) {
+		add(
+			'warning',
+			'W_HINT_UNREACHABLE',
+			{ blockId: block.block_id, field: 'hint' },
+			`Nápovědu ke kartě „${cardName}“ žák neuvidí: každý krok, u kterého se otazník ukazuje, má vlastní nápovědu.`
+		);
+	}
+	if (filled(block.help)) {
+		const opens = slots.some(
+			(step) => (filled(step.hint) || filled(block.hint)) && !filled(step.help)
+		);
+		if (!opens) {
+			const anyHint = filled(block.hint) || slots.some((step) => filled(step.hint));
+			add(
+				'warning',
+				'W_HINT_UNREACHABLE',
+				{ blockId: block.block_id, field: 'help' },
+				anyHint
+					? `Podrobnou pomoc ke kartě „${cardName}“ žák neuvidí: každý krok s nápovědou má vlastní pomoc.`
+					: `Podrobnou pomoc ke kartě „${cardName}“ žák neuvidí: otevírá se až z nápovědy, a ta v kartě chybí.`
+			);
+		}
+	}
+}
+
+function checkStructuralCompleteness(doc: CourseV2, block: BlockV2, add: Add) {
+	const blockRef: Ref = { blockId: block.block_id };
+	const cardName = blockLabel(doc, block);
+
+	if (block.type === 'display') {
+		const hasText = block.steps.some(
+			(s) => s.type === 'text' && typeof s.content === 'string' && s.content.trim() !== ''
+		);
+		const hasMedia = block.steps.some(
+			(s) => s.type === 'image' || s.type === 'video' || s.type === 'audio'
+		);
+		if (!hasText && !hasMedia) {
+			add(
+				'error',
+				'E_DISPLAY_NO_TEXT',
+				blockRef,
+				`Výkladová karta „${cardName}“ nemá žádný text. Žákovi se otevře prázdná karta.`
+			);
+		}
+	} else {
+		const questionSteps = block.steps.filter((s) => s.type === 'question');
+		if (questionSteps.length === 0) {
+			add(
+				'error',
+				'E_QUESTION_NO_QUESTION_STEP',
+				blockRef,
+				`Karta „${cardName}“ je typu ${block.type === 'exercise' ? 'Cvičení' : 'Otázka'}, ale neobsahuje žádnou otázku. Žák nemá co odpovědět a kartu nelze dokončit.`
+			);
+		}
+		for (const step of questionSteps) {
+			if (step.question === undefined) {
+				add(
+					'error',
+					'E_QUESTION_STEP_NO_CONFIG',
+					{ blockId: block.block_id, stepId: step.id },
+					`${capitalize(stepLabel(block, step))} v kartě „${cardName}“ je otázka, ale nemá zadané zadání ani odpovědi. Žák uvidí prázdnou otázku.`
+				);
+			}
+		}
+	}
+
+	for (const step of block.steps) {
+		const question = step.question;
+		if (question === undefined) continue;
+		checkQuestionShape(block, step, question, add);
+	}
+}
+
+/** §14.1 — every question type's structural requirements. */
+function checkQuestionShape(block: BlockV2, step: BlockStep, question: QuestionConfig, add: Add) {
+	const ref: Ref = { blockId: block.block_id, stepId: step.id };
+	const position = stepPosition(block, step);
+	const options = question.options ?? [];
+	const correct = options.filter((o) => o.is_correct === true);
+
+	switch (question.type) {
+		case 'open': {
+			const answer = question.correct_answer;
+			if (typeof answer !== 'string' || answer.trim() === '') {
+				// Every open answer is graded by the AI first; `correct_answer` is the
+				// comparison it falls back to offline (`block_step_engine.dart`
+				// `_confirmOpenAnswerWithAi`, `expected_answer.dart`, BR-N26ACB).
+				add(
+					'warning',
+					'W_OPEN_NO_CORRECT_ANSWER',
+					{ ...ref, field: 'question.correct_answer' },
+					`Otevřená otázka v kroku ${position} nemá zadanou správnou odpověď. Odpověď vyhodnotí AI, ale žákovi bez připojení se každá odpověď vyhodnotí jako chybná.`
+				);
+			}
+			checkAiSettings(question, { ...ref }, position, add);
+			break;
+		}
+		case 'numeric': {
+			if (typeof question.correct_number !== 'number') {
+				add(
+					'error',
+					'E_NUMERIC_NO_CORRECT_NUMBER',
+					{ ...ref, field: 'question.correct_number' },
+					`Číselná otázka v kroku ${position} nemá zadaný správný výsledek. Žákovi se každá odpověď vyhodnotí jako chybná.`
+				);
+			}
+			break;
+		}
+		case 'true_false': {
+			if (options.length !== 2) {
+				add(
+					'error',
+					'E_TF_OPTION_COUNT',
+					{ ...ref, field: 'question.options' },
+					`Otázka ano/ne v kroku ${position} má ${options.length} možnost(í) místo dvou. Žákovi se nezobrazí obě tlačítka.`
+				);
+			}
+			if (correct.length !== 1) {
+				add(
+					'error',
+					'E_TF_CORRECT_COUNT',
+					{ ...ref, field: 'question.options' },
+					`Otázka ano/ne v kroku ${position} má ${correct.length} správných odpovědí místo jedné. Vyhodnocení pro žáka nedá smysl.`
+				);
+			}
+			break;
+		}
+		case 'multiple_choice': {
+			if (options.length < MIN_CHOICE_OPTIONS) {
+				add(
+					'error',
+					'E_MC_TOO_FEW_OPTIONS',
+					{ ...ref, field: 'question.options' },
+					`Otázka v kroku ${position} má jen ${options.length} možnost(í). Žák nemá z čeho vybírat.`
+				);
+			}
+			// `show_answers: false` is how the spec writes an opinion question with no right
+			// answer, in every course type. A test without evaluation hides the switch, but
+			// a poll written with it must not stop the course from exporting.
+			if (correct.length === 0 && question.show_answers !== false) {
+				add(
+					'error',
+					'E_MC_NO_CORRECT',
+					{ ...ref, field: 'question.options' },
+					`Otázka v kroku ${position} nemá označenou žádnou správnou odpověď. Ať žák zvolí cokoli, dozví se, že chyboval.`
+				);
+			}
+			for (const option of options) {
+				if (typeof option.text !== 'string' || option.text.trim() === '') {
+					add(
+						'error',
+						'E_MC_EMPTY_OPTION_TEXT',
+						{ ...ref, optionId: option.id, field: 'text' },
+						`${capitalize(optionLabel(question, option))} v kroku ${position} nemá text. Žákovi se zobrazí prázdné tlačítko.`
+					);
+				}
+			}
+			break;
+		}
+	}
+}
+
+/**
+ * What the app does with an open question's AI settings (`block_model.dart`):
+ * `parseGuidedAttempts` clamps the attempts to 1–10, and `QuestionCriterion.listFromJson`
+ * drops unnamed criteria and keeps the first four. A setting the app ignores here (the
+ * same rule that hides its control) is not checked: a stored value it never uses is
+ * no problem.
+ */
+function checkAiSettings(question: QuestionConfig, ref: Ref, position: number, add: Add) {
+	const attempts = question.ai_guided_attempts;
+	if (
+		questionSettingApplies(question, 'ai_guided_attempts') &&
+		typeof attempts === 'number' &&
+		(!Number.isInteger(attempts) ||
+			attempts < GUIDED_ATTEMPTS_MIN ||
+			attempts > GUIDED_ATTEMPTS_MAX)
+	) {
+		const used = Math.min(GUIDED_ATTEMPTS_MAX, Math.max(GUIDED_ATTEMPTS_MIN, Math.trunc(attempts)));
+		add(
+			'warning',
+			'W_GUIDED_ATTEMPTS_RANGE',
+			{ ...ref, field: 'question.ai_guided_attempts' },
+			`Otázka v kroku ${position} dává ${attempts} pokusů; aplikace bere celé číslo ${GUIDED_ATTEMPTS_MIN}–${GUIDED_ATTEMPTS_MAX}, takže žák dostane ${used}.`
+		);
+	}
+	if (!questionSettingApplies(question, 'ai_criteria_list')) return;
+	const criteria = question.ai_criteria_list ?? [];
+	const named = criteria.filter((c) => (c.name ?? '').trim() !== '');
+	if (named.length < criteria.length) {
+		add(
+			'warning',
+			'W_AI_CRITERION_NO_NAME',
+			{ ...ref, field: 'question.ai_criteria_list' },
+			`Kritérium hodnocení u otázky v kroku ${position} nemá název, a tak ho AI nedostane.`
+		);
+	}
+	if (named.length > AI_CRITERIA_MAX) {
+		add(
+			'warning',
+			'W_AI_CRITERIA_TOO_MANY',
+			{ ...ref, field: 'question.ai_criteria_list' },
+			`Otázka v kroku ${position} má ${named.length} kritérií hodnocení; AI dostane jen první ${AI_CRITERIA_MAX}.`
+		);
+	}
+}
+
+/** §14.2 — every `go_to` resolves; §14 warning 3 — branching inside a drill is ignored. */
+function checkGoToTargets(
+	index: DocIndex,
+	block: BlockV2,
+	step: BlockStep,
+	question: QuestionConfig,
+	add: Add
+) {
+	// Answers of a question with several picks lead nowhere: the app reads no option's
+	// "Kam dál" there, so its target can't block export (`W_OPTION_OUTCOMES_IGNORED`).
+	if (!optionOutcomesApply(question)) return;
+	const ownSteps = index.stepsByBlock.get(block.block_id);
+	const position = stepPosition(block, step);
+
+	for (const option of question.options ?? []) {
+		const target = option.go_to;
+		if (typeof target !== 'string' || target === '') continue;
+		const ref: Ref = {
+			blockId: block.block_id,
+			stepId: step.id,
+			optionId: option.id,
+			field: 'go_to'
+		};
+		const optionName = capitalize(optionLabel(question, option));
+
+		if (goToIgnored(block)) {
+			add(
+				'warning',
+				'W_GOTO_IN_EXERCISE',
+				ref,
+				`${optionName} v kroku ${position} má nastavené větvení, ale karta je typu Cvičení — žák bude vždy pokračovat dál a na připravenou nápravu se nedostane.`
+			);
+			continue;
+		}
+
+		if (isGoToKeyword(target)) continue;
+		if (ownSteps?.has(target)) {
+			if (checksQuestionsInOneTap(block))
+				add(
+					'warning',
+					'W_GOTO_IN_ONE_TAP',
+					ref,
+					`${optionName} v kroku ${position} vede na jiný krok této karty, ale otázky karty žák zkontroluje najednou, takže půjde vždy dál.`
+				);
+			continue;
+		}
+		if (index.blocksById.has(target)) continue;
+
+		// The target itself is what is broken — it names neither a step of this block
+		// nor a block in the course — so there is nothing to resolve it to.
+		add(
+			'error',
+			'E_GOTO_UNRESOLVED',
+			ref,
+			`${optionName} v kroku ${position} vede na „${target}“, což není krok této karty ani karta v tomto kurzu. Žák, který ji zvolí, uvízne.`
+		);
+	}
+}
+
+/**
+ * A question that takes several answers judges the whole set, so the "Kam dál" and the
+ * grade set on single answers are never used (`optionOutcomesApply`). They stay in the
+ * file — the author may switch the option back — which is why this only warns.
+ */
+function checkIgnoredOutcomes(block: BlockV2, step: BlockStep, question: QuestionConfig, add: Add) {
+	if (question.allow_multiple !== true || optionOutcomesApply(question)) return;
+	const options = question.options ?? [];
+	const branches = options.some((o) => typeof o.go_to === 'string' && o.go_to !== '');
+	const marks = options.some((o) => typeof o.mark === 'string' && o.mark !== '');
+	if (!branches && !marks) return;
+	const what = branches && marks ? 'větvení ani známka' : branches ? 'větvení' : 'známka';
+	const outcome =
+		branches && marks
+			? 'Žák půjde vždy dál a známka se nezapočítá.'
+			: branches
+				? 'Žák půjde vždy dál.'
+				: 'Známka se nezapočítá.';
+	add(
+		'warning',
+		'W_OPTION_OUTCOMES_IGNORED',
+		{ blockId: block.block_id, stepId: step.id, field: 'question.allow_multiple' },
+		`Žák může v kroku ${stepPosition(block, step)} vybrat víc možností, a pak se u jednotlivých odpovědí nepoužije ${what}. ${outcome} Nastavení v kurzu zůstává, jen se nebere v úvahu.`
+	);
+}
+
+function checkFeedbackQuality(block: BlockV2, step: BlockStep, question: QuestionConfig, add: Add) {
+	const options = question.options ?? [];
+	const wrong = options.filter((o) => o.is_correct !== true);
+	const position = stepPosition(block, step);
+
+	// §14 warning 9
+	if (
+		wrong.length > 0 &&
+		question.show_answers !== false &&
+		!wrong.some((o) => typeof o.feedback === 'string' && o.feedback.trim() !== '')
+	) {
+		add(
+			'warning',
+			'W_NO_WRONG_OPTION_FEEDBACK',
+			{ blockId: block.block_id, stepId: step.id, field: 'question.options' },
+			`Žádná chybná odpověď v kroku ${position} nemá zpětnou vazbu. Žák se nedozví, kde udělal chybu — jen že chyboval.`
+		);
+	}
+
+	// §14 warning 10. A wrong answer always scores 0 outside AI grading
+	// (`block_step_engine.dart`: `effectiveScoreKoef = isCorrect ? scoreKoef : 0.0`).
+	for (const option of options) {
+		if (
+			option.is_correct !== true &&
+			typeof option.score_koef === 'number' &&
+			option.score_koef > 0
+		) {
+			add(
+				'warning',
+				'W_PARTIAL_CREDIT_ON_WRONG',
+				{ blockId: block.block_id, stepId: step.id, optionId: option.id, field: 'score_koef' },
+				`${capitalize(optionLabel(question, option))} v kroku ${position} je označená jako chybná a má podíl bodů ${Math.round(option.score_koef * 100)} %. Za chybnou odpověď aplikace body nedává, takže se podíl nepoužije.`
+			);
+		}
+	}
+}
+
+/** §14.5 — media must be playable for the student. */
+function checkMedia(block: BlockV2, step: BlockStep, add: Add, graded: boolean) {
+	const ref: Ref = { blockId: block.block_id, stepId: step.id };
+	const position = stepPosition(block, step);
+
+	// A brand-new media step starts with `url: ''` (`addStep` in commands.ts) — the
+	// same situation as a text step with no content, and just as invisible to the
+	// student, so it is an error for the same reason `E_DISPLAY_NO_TEXT` is: nothing
+	// renders in its place. The wording stays a plain statement of fact ("zatím
+	// nemá") rather than a complaint, because this fires the moment the step is
+	// added, before the author has had a chance to paste anything in.
+	if (step.type === 'video' && (step.video?.url ?? '').trim() === '') {
+		add(
+			'error',
+			'E_VIDEO_NO_URL',
+			{ ...ref, field: 'video.url' },
+			`Video v kroku ${position} zatím nemá žádnou adresu. Dokud ji nevyplníš, žákovi se na jeho místě nezobrazí nic.`
+		);
+	}
+	if (step.type === 'image' && (step.image?.url ?? '').trim() === '') {
+		add(
+			'error',
+			'E_IMAGE_NO_URL',
+			{ ...ref, field: 'image.url' },
+			`Obrázek v kroku ${position} zatím nemá žádnou adresu. Dokud ji nevyplníš, žákovi se na jeho místě nezobrazí nic.`
+		);
+	}
+	if (step.type === 'audio' && (step.audio?.url ?? '').trim() === '') {
+		add(
+			'error',
+			'E_AUDIO_NO_URL',
+			{ ...ref, field: 'audio.url' },
+			`Zvuk v kroku ${position} zatím nemá žádnou adresu. Dokud ji nevyplníš, žákovi se na jeho místě nic nepřehraje.`
+		);
+	}
+
+	const video = step.video?.url;
+	if (typeof video === 'string' && video !== '') {
+		if (/youtube\.com|youtu\.be|vimeo\.com/i.test(video)) {
+			add(
+				'error',
+				'E_MEDIA_NOT_DIRECT',
+				{ ...ref, field: 'video.url' },
+				`Video v kroku ${position} odkazuje na stránku YouTube nebo Vimeo. Přehrávač potřebuje přímý odkaz na MP4 — takto se žákovi nepřehraje nic.`
+			);
+		}
+		checkHttps(video, { ...ref, field: 'video.url' }, `Video v kroku ${position}`, add);
+	}
+
+	const image = step.image?.url;
+	if (typeof image === 'string' && image !== '') {
+		checkHttps(image, { ...ref, field: 'image.url' }, `Obrázek v kroku ${position}`, add);
+	}
+	const audio = step.audio?.url;
+	if (typeof audio === 'string' && audio !== '') {
+		checkHttps(audio, { ...ref, field: 'audio.url' }, `Zvuk v kroku ${position}`, add);
+	}
+	const solutionImage = step.question?.solution_image?.url;
+	if (graded && typeof solutionImage === 'string' && solutionImage !== '') {
+		checkHttps(
+			solutionImage,
+			{ ...ref, field: 'question.solution_image.url' },
+			`Obrázek u řešení v kroku ${position}`,
+			add
+		);
+	}
+
+	// §15 accessibility nudge. Only for a picture that is there: with no address the
+	// error above is the one to fix, and the editor draws no description field yet.
+	if (step.type === 'image' && step.image !== undefined && (step.image.url ?? '').trim() !== '') {
+		const alt = step.image.alt;
+		if (typeof alt !== 'string' || alt.trim() === '') {
+			add(
+				'warning',
+				'W_IMAGE_NO_ALT',
+				{ ...ref, field: 'image.alt' },
+				`Obrázek v kroku ${position} nemá popis. Žák, který používá čtečku obrazovky, se nedozví, co je na něm — a stejný text se ukáže, když se obrázek nenačte.`
+			);
+		}
+	}
+
+	// The image and the video share one position, so one warning covers both.
+	const hidden = (['image', 'video'] as const).filter((media) => mediaHidden(step, media));
+	if (hidden.length > 0) {
+		const what =
+			hidden.length === 2 ? 'Obrázek a video' : hidden[0] === 'image' ? 'Obrázek' : 'Video';
+		const them = hidden.length === 2 ? 'je' : 'ho';
+		add(
+			'warning',
+			'W_MEDIA_HIDDEN',
+			{ ...ref, field: positionField(step) },
+			`${what} v kroku ${position} ${hidden.length === 2 ? 'mají' : 'má'} umístění, které aplikace neumí vykreslit — žák ${them} neuvidí. Zvol „Nad textem“ nebo „Pod textem“.`
+		);
+	}
+}
+
+function checkHttps(url: string, ref: Ref, subject: string, add: Add) {
+	if (url.startsWith('https://')) return;
+	add(
+		'error',
+		'E_MEDIA_NOT_HTTPS',
+		ref,
+		`${subject} není na adrese https:// — ve webové verzi aplikace se žákovi nenačte.`
+	);
+}
+
+// ────────────────────────────────── §14.3 vectors ──────────────────────────────────
+
+function checkVectors(
+	doc: CourseV2,
+	block: BlockV2,
+	skillConfig: SkillConfig | null | undefined,
+	add: Add
+) {
+	const gpf = block.gpf;
+	if (gpf === undefined) return;
+	const expected = dimensionCount(skillConfig);
+	const cardName = blockLabel(doc, block);
+
+	for (const name of ['relation_vector', 'elo_vector'] as const) {
+		const vector = gpf[name];
+		if (vector === undefined) continue;
+		const ref: Ref = { blockId: block.block_id, field: `gpf.${name}` };
+
+		if (expected !== null && vector.length !== expected) {
+			add(
+				'error',
+				'E_VECTOR_LENGTH',
+				ref,
+				`Vektor ${name} v kartě „${cardName}“ má ${vector.length} hodnot, kurz jich používá ${expected}. Výsledek žáka se do jeho profilu dovedností nezapíše.`
+			);
+		}
+	}
+
+	const relation = gpf.relation_vector;
+	if (relation !== undefined) {
+		const ref: Ref = { blockId: block.block_id, field: 'gpf.relation_vector' };
+		for (const [i, value] of relation.entries()) {
+			if (value !== 0 && value !== 1 && value !== 2) {
+				add(
+					'error',
+					'E_RELATION_VECTOR_VALUE',
+					ref,
+					`Vektor relation_vector v kartě „${cardName}“ má na pozici ${i} hodnotu ${value}; povolené jsou jen 0, 1 a 2. Výsledek žáka se nezapíše.`
+				);
+				break;
+			}
+		}
+		const strong = relation.filter((v) => v === 2).length;
+		if (strong > 3) {
+			add(
+				'warning',
+				'W_TOO_MANY_STRONG_RELATIONS',
+				ref,
+				`Karta „${cardName}“ tvrdí silný vztah k ${strong} dovednostem. Jedna odpověď žáka se rozmělní mezi všechny a profil dovedností bude nepřesný.`
+			);
+		}
+		if (relation.every((v) => v === 0) && gpf.elo_vector !== undefined) {
+			add(
+				'warning',
+				'W_RELATION_VECTOR_ALL_ZERO',
+				ref,
+				`Karta „${cardName}“ má vyplněnou obtížnost, ale žádnou vazbu na dovednost. Žák ji vyřeší a v jeho profilu se nic nepohne.`
+			);
+		}
+	}
+
+	const elo = gpf.elo_vector;
+	if (elo !== undefined) {
+		const ref: Ref = { blockId: block.block_id, field: 'gpf.elo_vector' };
+		for (const [i, value] of elo.entries()) {
+			if (value < ELO_MIN || value > ELO_MAX) {
+				add(
+					'error',
+					'E_ELO_VECTOR_RANGE',
+					ref,
+					`Obtížnost v elo_vector karty „${cardName}“ je na pozici ${i} rovna ${value}; povolený rozsah je ${ELO_MIN}–${ELO_MAX}. Adaptivní výběr úloh pro žáka přestane dávat smysl.`
+				);
+				break;
+			}
+		}
+	}
+}
+
+function meanElo(doc: CourseV2): number | null {
+	let sum = 0;
+	let count = 0;
+	for (const block of doc.blocks) {
+		const relation = block.gpf?.relation_vector;
+		const elo = block.gpf?.elo_vector;
+		if (elo === undefined) continue;
+		for (const [i, value] of elo.entries()) {
+			if (relation !== undefined && (relation[i] ?? 0) === 0) continue;
+			sum += value;
+			count++;
+		}
+	}
+	return count === 0 ? null : sum / count;
+}
+
+/** §14 warning 8 — an outlier difficulty with no author estimate to back it up. */
+function checkEloOutlier(doc: CourseV2, block: BlockV2, courseMean: number | null, add: Add) {
+	if (courseMean === null) return;
+	const elo = block.gpf?.elo_vector;
+	if (elo === undefined) return;
+	if (typeof block.learning?.difficulty === 'number') return;
+
+	const relation = block.gpf?.relation_vector;
+	const relevant = elo.filter((_, i) => relation === undefined || (relation[i] ?? 0) > 0);
+	if (relevant.length === 0) return;
+	const mean = relevant.reduce((a, b) => a + b, 0) / relevant.length;
+
+	if (Math.abs(mean - courseMean) > 2) {
+		add(
+			'warning',
+			'W_ELO_OUTLIER',
+			{ blockId: block.block_id, field: 'gpf.elo_vector' },
+			`Karta „${blockLabel(doc, block)}“ je nastavená jako výrazně ${mean > courseMean ? 'těžší' : 'lehčí'} než zbytek kurzu (${mean.toFixed(1)} proti průměru ${courseMean.toFixed(1)}), ale nemá vyplněnou vlastní obtížnost. Než se obtížnost dopočítá z dat, může se žákovi nabídnout ve špatnou chvíli.`
+		);
+	}
+}
+
+// ─────────────────────────── §14.4 prerequisites ───────────────────────────
+
+function checkPrerequisiteGraph(doc: CourseV2, index: DocIndex, add: Add) {
+	for (const block of doc.blocks) {
+		const cardName = blockLabel(doc, block);
+		for (const [i, rule] of (block.learning?.prerequisites ?? []).entries()) {
+			const ref: Ref = { blockId: block.block_id, field: `learning.prerequisites.${i}` };
+
+			if (
+				typeof rule.block_id === 'string' &&
+				rule.block_id !== '' &&
+				!index.blocksById.has(rule.block_id)
+			) {
+				// The required card is what does not exist — nothing to name it by.
+				add(
+					'error',
+					'E_PREREQ_UNRESOLVED',
+					ref,
+					`Karta „${cardName}“ vyžaduje zvládnutou kartu „${rule.block_id}“, která v kurzu není. Žákovi se karta nikdy neodemkne.`
+				);
+			}
+			if (rule.min_level >= 0.9) {
+				add(
+					'warning',
+					'W_PREREQ_MIN_LEVEL_HIGH',
+					ref,
+					`Karta „${cardName}“ se odemkne až při zvládnutí na ${Math.round(rule.min_level * 100)} %. Téměř žádný žák se k ní nedostane.`
+				);
+			}
+		}
+	}
+
+	for (const cycle of findCycles(doc)) {
+		// Every id in a cycle is, by construction (`findCycles` only follows edges to
+		// blocks that exist), a real card — so unlike the two checks above, there is
+		// always a name to give it and no reason to fall back to the id.
+		const names = cycle.map((id) => {
+			const block = doc.blocks.find((b) => b.block_id === id)!;
+			return `„${blockLabel(doc, block)}“`;
+		});
+		add('error', 'E_PREREQ_CYCLE', { blockId: cycle[0] }, cycleMessage(names.slice(0, -1)));
+	}
+}
+
+/**
+ * A cycle in words. `findCycles` closes each cycle on its first id, which the caller
+ * drops; the names are then listed as a sentence rather than joined with arrows.
+ */
+function cycleMessage(names: string[]): string {
+	if (names.length === 1) return `Karta ${names[0]} čeká sama na sebe. Žákovi se neodemkne.`;
+	const list = `${names.slice(0, -1).join(', ')} a ${names.at(-1)}`;
+	return `Karty ${list} na sebe čekají navzájem. Žádná z nich se žákovi neodemkne.`;
+}
+
+/** Who waits for whom: each card to the cards named in its prerequisites. */
+function prerequisiteEdges(doc: CourseV2): Map<string, string[]> {
+	const edges = new Map<string, string[]>();
+	for (const block of doc.blocks) {
+		edges.set(
+			block.block_id,
+			(block.learning?.prerequisites ?? [])
+				.map((r) => r.block_id)
+				.filter((id): id is string => typeof id === 'string' && id !== '')
+		);
+	}
+	return edges;
+}
+
+/**
+ * The cards that already wait for this one, directly or through others. Naming one of
+ * them as this card's prerequisite would close a cycle (`findCycles`), so the picker
+ * for prerequisites offers none of them.
+ */
+export function cardsWaitingFor(doc: CourseV2, blockId: string): Set<string> {
+	const edges = prerequisiteEdges(doc);
+	const waiting = new Set<string>();
+	let grew = true;
+	while (grew) {
+		grew = false;
+		for (const [id, needs] of edges) {
+			if (waiting.has(id)) continue;
+			if (needs.some((n) => n === blockId || waiting.has(n))) {
+				waiting.add(id);
+				grew = true;
+			}
+		}
+	}
+	return waiting;
+}
+
+function findCycles(doc: CourseV2): string[][] {
+	const edges = prerequisiteEdges(doc);
+
+	const cycles: string[][] = [];
+	const state = new Map<string, 'visiting' | 'done'>();
+	const stack: string[] = [];
+	const reported = new Set<string>();
+
+	const visit = (id: string) => {
+		const current = state.get(id);
+		if (current === 'done') return;
+		if (current === 'visiting') {
+			const start = stack.indexOf(id);
+			const cycle = stack.slice(start);
+			const key = [...cycle].sort().join('|');
+			if (!reported.has(key)) {
+				reported.add(key);
+				cycles.push([...cycle, id]);
+			}
+			return;
+		}
+		state.set(id, 'visiting');
+		stack.push(id);
+		for (const next of edges.get(id) ?? []) if (edges.has(next)) visit(next);
+		stack.pop();
+		state.set(id, 'done');
+	};
+
+	for (const id of edges.keys()) visit(id);
+	return cycles;
+}
+
+// ───────────────────────────────── course level ─────────────────────────────────
+
+function checkCourseLevel(doc: CourseV2, index: DocIndex, options: ValidateOptions, add: Add) {
+	if (
+		options.lastPublishedVersion !== undefined &&
+		typeof doc.version === 'number' &&
+		doc.version <= options.lastPublishedVersion
+	) {
+		add(
+			'warning',
+			'W_VERSION_NOT_BUMPED',
+			{ field: 'version' },
+			`Verze kurzu je stále ${doc.version}, stejně jako u posledního zveřejnění. Žáci, kteří kurz už mají stažený, novou verzi nedostanou.`
+		);
+	}
+
+	// §14 warning 12. The app seeds no practice card from an only_once course
+	// (`practice_repository.dart`, BR-E495XK).
+	if (doc.only_once === true) {
+		const practice = doc.blocks.filter((b) =>
+			isPracticeBlock(b, bindingPractice(index, b.block_id))
+		);
+		if (practice.length > 0) {
+			add(
+				'warning',
+				'W_ONLY_ONCE_WITH_PRACTICE',
+				{ field: 'only_once' },
+				`Kurz je nastavený na jediné projití, ale ${practice.length} karet je zařazeno do opakování. Z kurzu na jedno projití aplikace nic nezařadí do denního opakování.`
+			);
+		}
+	}
+}
+
+function bindingPractice(index: DocIndex, blockId: string): boolean {
+	return (index.referencesToBlock.get(blockId) ?? []).some(
+		(reference) =>
+			reference.kind === 'binding' &&
+			reference.from.lessonId !== undefined &&
+			index.lessonsById
+				.get(reference.from.lessonId)
+				?.blocks.some((b) => b.block_id === blockId && b.default_practice === true) === true
+	);
+}

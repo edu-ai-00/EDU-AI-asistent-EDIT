@@ -1,0 +1,521 @@
+import { readFileSync } from 'node:fs';
+import { expect, openEditor, test, type Page } from './fixtures';
+
+/**
+ * The answer table of a question step: what it hides until it is needed, what its
+ * markers say, and which columns a question with several picks has.
+ */
+const fixture = () =>
+	JSON.parse(
+		readFileSync(
+			new URL('../src/lib/domain/__tests__/fixtures/spec-16-course.json', import.meta.url),
+			'utf8'
+		)
+	);
+
+const trash = (page: Page) => page.getByRole('button', { name: /^Smazat odpověď/ });
+const multipleBox = (page: Page) => page.getByRole('checkbox', { name: 'Víc správných možností' });
+/** The switch's box is drawn as a track, so it is the label that gets clicked. */
+const multiple = (page: Page) => ({
+	check: () =>
+		page
+			.getByText('Víc správných možností', { exact: true })
+			.click()
+			.then(() => expect(multipleBox(page)).toBeChecked()),
+	uncheck: () =>
+		page
+			.getByText('Víc správných možností', { exact: true })
+			.click()
+			.then(() => expect(multipleBox(page)).not.toBeChecked())
+});
+const head = (page: Page) => page.locator('.answers .head');
+
+/** A fresh question card: two answers, one right. */
+async function addQuestionCard(page: Page) {
+	await page.locator('.tree-add').getByRole('button', { name: 'Otázka', exact: true }).click();
+	await expect(page.getByRole('textbox', { name: 'Text odpovědi' }).first()).toBeVisible();
+}
+
+async function loadCourse(page: Page, edit: (doc: ReturnType<typeof fixture>) => void = () => {}) {
+	const doc = fixture();
+	edit(doc);
+	await page.setInputFiles('input[type=file]', {
+		name: 'course.json',
+		mimeType: 'application/json',
+		buffer: Buffer.from(JSON.stringify(doc))
+	});
+	await page.locator('.tree-card').nth(2).click();
+	await expect(page.locator('.answers').first()).toBeVisible();
+}
+
+test.beforeEach(async ({ page }) => {
+	// Wide enough for the table's own columns; below 760px the feedback goes under the
+	// answer and the heading goes.
+	await page.setViewportSize({ width: 2200, height: 1100 });
+	await openEditor(page);
+});
+
+test('on a desktop with both side columns open, an answer is still one line', async ({ page }) => {
+	// The narrow table used to put the handle, the mark, the text and the actions each
+	// on a line of their own: four lines for one answer, at an ordinary 1440 px.
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await addQuestionCard(page);
+	const middle = async (name: string | RegExp, role: 'button' | 'textbox' = 'button') => {
+		const box = (await page.getByRole(role, { name }).first().boundingBox())!;
+		return box.y + box.height / 2;
+	};
+	const text = (await page.getByRole('textbox', { name: 'Text odpovědi' }).first().boundingBox())!;
+	const inLine = (y: number) => y > text.y && y < text.y + text.height;
+
+	expect(inLine(await middle(/^Přesunout odpověď/))).toBe(true);
+	expect(inLine(await middle(/^Správná odpověď/))).toBe(true);
+	expect(inLine(await middle(/^Podrobnosti odpovědi/))).toBe(true);
+	// The feedback is under the answer, not beside it.
+	const feedback = (await page
+		.getByRole('textbox', { name: 'Zpětná vazba k této odpovědi' })
+		.first()
+		.boundingBox())!;
+	expect(feedback.y).toBeGreaterThan(text.y + text.height);
+	expect(Math.abs(feedback.x - text.x)).toBeLessThan(2);
+});
+
+test('the trash of an answer is faintly there, full when its row is pointed at, and red only under the pointer', async ({
+	page
+}) => {
+	await addQuestionCard(page);
+	await page.getByRole('button', { name: 'Další odpověď' }).click();
+	await expect(trash(page)).toHaveCount(3);
+
+	const opacity = (i: number) =>
+		trash(page)
+			.nth(i)
+			.evaluate((el) => Number(getComputedStyle(el.parentElement!).opacity));
+	const color = (i: number) =>
+		trash(page)
+			.nth(i)
+			.evaluate((el) => getComputedStyle(el).color);
+	await page.mouse.move(0, 0);
+	// Faint, never invisible: a teacher must be able to see that an answer can go.
+	await expect.poll(() => opacity(0)).toBe(0.45);
+
+	const rows = page.locator('.answers .row');
+	await rows.nth(0).hover();
+	await expect.poll(() => opacity(0)).toBe(1);
+	await expect.poll(() => opacity(1)).toBe(0.45);
+	const rest = await color(0);
+
+	await trash(page).nth(0).hover();
+	await expect.poll(() => color(0)).not.toBe(rest);
+
+	// Working in a row shows it too, so a keyboard can reach it.
+	await page.mouse.move(0, 0);
+	await rows.nth(1).getByRole('textbox', { name: 'Text odpovědi' }).click();
+	await expect.poll(() => opacity(1)).toBe(1);
+});
+
+test('a question cannot lose answers below the two it needs, and says why', async ({ page }) => {
+	await addQuestionCard(page);
+	await expect(trash(page)).toHaveCount(2);
+	for (const button of await trash(page).all()) {
+		await expect(button).toBeDisabled();
+		await expect(button).toHaveAttribute('title', /aspoň dvě/);
+	}
+
+	await page.getByRole('button', { name: 'Další odpověď' }).click();
+	await expect(trash(page)).toHaveCount(3);
+	await expect(trash(page).first()).toBeEnabled();
+	await trash(page).first().click({ force: true });
+	await expect(trash(page)).toHaveCount(2);
+	await expect(trash(page).first()).toBeDisabled();
+});
+
+test('the marker is a circle, or a square when several answers may be picked, and filled when right', async ({
+	page
+}) => {
+	await addQuestionCard(page);
+	const markers = page.getByRole('button', { name: /^Správná odpověď:/ });
+	const shape = (i: number) =>
+		markers
+			.nth(i)
+			.locator('.mark-box')
+			.evaluate((el) => {
+				const style = getComputedStyle(el);
+				return { radius: parseFloat(style.borderTopLeftRadius), fill: style.backgroundColor };
+			});
+
+	const right = await shape(0);
+	const wrong = await shape(1);
+	expect(wrong.radius).toBeGreaterThanOrEqual(10);
+	expect(right.fill).not.toBe(wrong.fill);
+	// The right one carries a tick, the wrong one is empty.
+	await expect(markers.nth(0).locator('svg')).toHaveCount(1);
+	await expect(markers.nth(1).locator('svg')).toHaveCount(0);
+
+	await multiple(page).check();
+	expect((await shape(1)).radius).toBeLessThan(10);
+	await multiple(page).uncheck();
+	expect((await shape(1)).radius).toBeGreaterThanOrEqual(10);
+});
+
+test('the several-picks switch is worded once, and explains itself only while it is on', async ({
+	page
+}) => {
+	await addQuestionCard(page);
+	const hint = page.getByText('za částečný výběr nejsou body');
+	await expect(multipleBox(page)).not.toBeChecked();
+	await expect(hint).toHaveCount(0);
+	await multiple(page).check();
+	await expect(hint).toBeVisible();
+	await multiple(page).uncheck();
+	await expect(hint).toHaveCount(0);
+});
+
+const details = (page: Page) => page.getByRole('button', { name: /^Podrobnosti odpovědi/ });
+
+test('a question with several picks has no "Kam dál" and no grade, since the app reads neither', async ({
+	page
+}) => {
+	await loadCourse(page, (doc) => {
+		doc.quiz_evaluate = true;
+	});
+	// Both live in the answer's detail line, which is closed until it is asked for.
+	await expect(page.getByRole('radiogroup', { name: 'Známka za tuto odpověď' })).toHaveCount(0);
+	await details(page).first().click();
+	await expect(details(page).first()).toHaveAttribute('aria-expanded', 'true');
+	await expect(
+		page.getByRole('radiogroup', { name: 'Známka za tuto odpověď' }).first()
+	).toBeVisible();
+	await expect(
+		page.getByRole('button', { name: 'Kam pokračovat po této odpovědi' }).first()
+	).toBeVisible();
+
+	// Switching to several picks drops both fields, so the line has nothing left to
+	// show and closes. The values stay in the card; switching back shows them again.
+	await multiple(page).check();
+	await expect(page.getByRole('radiogroup', { name: 'Známka za tuto odpověď' })).toHaveCount(0);
+	await expect(page.getByRole('button', { name: 'Kam pokračovat po této odpovědi' })).toHaveCount(
+		0
+	);
+
+	// The values are still in the card; switching back shows them again.
+	await multiple(page).uncheck();
+	await expect(
+		page
+			.getByRole('radiogroup', { name: 'Známka za tuto odpověď' })
+			.first()
+			.getByRole('radio', { name: '1', exact: true })
+	).toHaveAttribute('aria-checked', 'true');
+});
+
+test('the detail line opens from the row, and a set value is read without opening it', async ({
+	page
+}) => {
+	await loadCourse(page, (doc) => {
+		doc.quiz_evaluate = true;
+		const options = doc.blocks.find((b: { block_id: string }) => b.block_id === 'L1_B3_poznej')
+			.steps[1].question.options;
+		for (const option of options) {
+			delete option.mark;
+			delete option.go_to;
+		}
+		options[0].mark = '2';
+		options[1].go_to = 'END';
+	});
+	const rows = page.locator('.answers .row');
+	// The control is faint until the row is pointed at, and named for a screen reader.
+	await expect(details(page).first()).toHaveCSS('opacity', '0.45');
+	await rows.first().hover();
+	await expect(details(page).first()).toHaveCSS('opacity', '1');
+
+	// A value that is set shows as inert text; the unset answer says nothing.
+	await expect(rows.nth(0).locator('.set-values')).toHaveText('známka 2');
+	await expect(rows.nth(1).locator('.set-values')).toHaveText('konec karty');
+	await expect(rows.nth(2).locator('.set-values')).toHaveCount(0);
+
+	// Opening the line swaps the text for the fields that hold the values.
+	await details(page).first().click();
+	await expect(rows.first().locator('.set-values')).toHaveCount(0);
+	await expect(
+		rows
+			.first()
+			.getByRole('radiogroup', { name: 'Známka za tuto odpověď' })
+			.getByRole('radio', { name: '2', exact: true })
+	).toHaveAttribute('aria-checked', 'true');
+	await details(page).first().click();
+	await expect(
+		rows.first().getByRole('radiogroup', { name: 'Známka za tuto odpověď' })
+	).toHaveCount(0);
+});
+
+test('an answer is reordered by dragging its handle, and the handle answers the arrow keys', async ({
+	page
+}) => {
+	await loadCourse(page);
+	const rows = page.locator('.answers .row');
+	// The answers' own text: the summary line under a row changes as its details open.
+	const texts = () => {
+		return rows
+			.getByRole('textbox', { name: 'Text odpovědi' })
+			.evaluateAll((els) => els.map((el) => (el as HTMLInputElement).value ?? el.textContent));
+	};
+	const before = await texts();
+	expect(before.length).toBeGreaterThan(2);
+
+	const grip = (i: number) => rows.nth(i).getByRole('button', { name: /^Přesunout odpověď/ });
+
+	// The first answer is carried past the last one by its own handle.
+	const from = (await grip(0).boundingBox())!;
+	const x = from.x + from.width / 2;
+	await page.mouse.move(x, from.y + from.height / 2);
+	await page.mouse.down();
+	await page.mouse.move(x, from.y + 20, { steps: 4 });
+	const last = (await rows.last().boundingBox())!;
+	await page.mouse.move(x, last.y + last.height + 8, { steps: 10 });
+	// The carried row is lifted, and the list is already in the order the drop gives.
+	await expect(page.locator('.rows .row.dragged')).toHaveCount(1);
+	await expect.poll(texts).toEqual([...before.slice(1), before[0]]);
+	await page.mouse.up();
+	await expect(page.locator('.rows .row.dragged')).toHaveCount(0);
+	await expect.poll(texts).toEqual([...before.slice(1), before[0]]);
+
+	// Takes the first answer by its handle and carries it under the last one, measuring
+	// both right before the press: the dropped row slides into place for a moment, and
+	// hovering waits for its handle to stop.
+	const carryFirst = async () => {
+		await grip(0).hover();
+		const handle = (await grip(0).boundingBox())!;
+		const end = (await rows.last().boundingBox())!;
+		await page.mouse.move(x, handle.y + handle.height / 2);
+		await page.mouse.down();
+		await page.mouse.move(x, handle.y + 20, { steps: 4 });
+		await page.mouse.move(x, end.y + end.height + 8, { steps: 10 });
+		await expect(page.locator('.rows .row.dragged')).toHaveCount(1);
+	};
+
+	// A drag the window takes away (a screenshot tool, another app) puts the answer
+	// back and leaves nothing in the dragging look.
+	const moved = await texts();
+	await carryFirst();
+	await page.evaluate(() => {
+		document.hasFocus = () => false;
+		window.dispatchEvent(new Event('blur'));
+	});
+	await expect(page.locator('.rows .row.dragged')).toHaveCount(0);
+	await expect.poll(texts).toEqual(moved);
+	await page.mouse.up();
+	await expect.poll(texts).toEqual(moved);
+	await page.evaluate(() => {
+		document.hasFocus = () => true;
+	});
+
+	// An undo while an answer is held ends the drag too, and the release drops nothing.
+	await carryFirst();
+	await page.keyboard.press('Control+z');
+	await expect(page.locator('.rows .row.dragged')).toHaveCount(0);
+	await expect.poll(texts).toEqual(before);
+	await page.mouse.up();
+	await expect.poll(texts).toEqual(before);
+	await page.keyboard.press('Control+y');
+	await expect.poll(texts).toEqual(moved);
+
+	// The handle answers the arrow keys too, and keeps its focus through the move. The
+	// moved answer (now last) swaps back up one place.
+	const swappedUp = [...before.slice(1, -1), before[0], before[before.length - 1]];
+	await grip(before.length - 1).focus();
+	await page.keyboard.press('ArrowUp');
+	await expect.poll(texts).toEqual(swappedUp);
+	await expect(grip(2)).toBeFocused();
+
+	// At the ends it stays put: the first answer cannot go up.
+	await grip(0).focus();
+	await page.keyboard.press('ArrowUp');
+	await expect.poll(texts).toEqual(swappedUp);
+});
+
+test('the answer that makes way slides once, however the pointer keeps moving', async ({
+	page
+}) => {
+	await loadCourse(page);
+	const rows = page.locator('.answers .row');
+	// Counts the slides the second answer starts from here on: Svelte holds each slide's
+	// first frame with a 0 ms animation before running it, which is no slide.
+	await rows.nth(1).evaluate((row) => {
+		const counted = window as unknown as { slides: number };
+		counted.slides = 0;
+		const animate = row.animate.bind(row);
+		row.animate = (keyframes, options) => {
+			if (typeof options === 'object' && Number(options.duration) > 0) counted.slides += 1;
+			return animate(keyframes, options);
+		};
+	});
+	const grip = rows.nth(0).getByRole('button', { name: /^Přesunout odpověď/ });
+	const handle = (await grip.boundingBox())!;
+	const second = (await rows.nth(1).boundingBox())!;
+	const x = handle.x + handle.width / 2;
+	await page.mouse.move(x, handle.y + handle.height / 2);
+	await page.mouse.down();
+	// Past the second answer's middle in one move, then on in small ones while it slides.
+	await page.mouse.move(x, handle.y + handle.height / 2 + second.height * 1.2);
+	await page.mouse.move(x, handle.y + handle.height / 2 + second.height * 1.4, { steps: 8 });
+	await expect.poll(() => rows.nth(0).evaluate((row) => row.getAnimations().length)).toBe(0);
+	expect(await page.evaluate(() => (window as unknown as { slides: number }).slides)).toBe(1);
+	await page.mouse.up();
+});
+
+test('the heading row goes when "Odpověď" would be its only label', async ({ page }) => {
+	await addQuestionCard(page);
+	await expect(head(page)).toBeVisible();
+	await page.getByRole('button', { name: 'Zpětná vazba', exact: true }).click();
+	await expect(head(page)).toHaveCount(0);
+	await page.getByRole('button', { name: 'Zpětná vazba', exact: true }).click();
+	await expect(head(page)).toBeVisible();
+});
+
+test('what is wrong with the list of answers is said under it', async ({ page }) => {
+	await loadCourse(page, (doc) => {
+		const question = doc.blocks.find((b: { block_id: string }) => b.block_id === 'L1_B3_poznej')
+			.steps[1].question;
+		question.options = question.options.slice(0, 1);
+	});
+	// Errors of a card wait until the card is left.
+	await expect(page.locator('.answers .list-issue')).toHaveCount(0);
+	await page.locator('.tree-card').nth(0).click();
+	await page.locator('.tree-card').nth(2).click();
+	await expect(page.locator('.answers .list-issue')).toContainText('Žák nemá z čeho vybírat');
+});
+
+test('a problem with where an answer leads opens that answer’s detail line by itself', async ({
+	page
+}) => {
+	await loadCourse(page, (doc) => {
+		const options = doc.blocks.find((b: { block_id: string }) => b.block_id === 'L1_B3_poznej')
+			.steps[1].question.options;
+		options[1].go_to = 'neexistuje';
+	});
+	// Errors of a card wait until the card is left.
+	await page.locator('.tree-card').nth(0).click();
+	await page.locator('.tree-card').nth(2).click();
+	const rows = page.locator('.answers .row');
+	await expect(
+		rows.nth(1).getByRole('button', { name: 'Kam pokračovat po této odpovědi' })
+	).toBeVisible();
+	await expect(
+		rows.nth(0).getByRole('button', { name: 'Kam pokračovat po této odpovědi' })
+	).toHaveCount(0);
+});
+
+test('a detail line that was pointed at can still be closed by hand', async ({ page }) => {
+	await loadCourse(page);
+	const first = page.locator('.answers .row').first();
+	const more = first.getByRole('button', { name: /^Podrobnosti odpovědi/ });
+	// A warning on the row may have opened it already.
+	if ((await more.getAttribute('aria-expanded')) !== 'true') await more.click();
+	await expect(more).toHaveAttribute('aria-expanded', 'true');
+	await first.getByRole('button', { name: 'Kam pokračovat po této odpovědi' }).click();
+	await page
+		.getByRole('dialog', { name: 'Kam pokračovat po této odpovědi' })
+		.getByRole('button', { name: 'Ukončit kartu' })
+		.click();
+	await first.getByRole('button', { name: /^Podrobnosti odpovědi/ }).click();
+	await expect(first.getByRole('button', { name: 'Kam pokračovat po této odpovědi' })).toHaveCount(
+		0
+	);
+	await expect(first.locator('.set-values')).toContainText('konec karty');
+});
+
+/** The "Kam dál" box of the first answer whose line is open. */
+const goTo = (page: Page) => page.getByRole('button', { name: 'Kam pokračovat po této odpovědi' });
+const goToBox = (page: Page) =>
+	page.getByRole('dialog', { name: 'Kam pokračovat po této odpovědi' });
+
+test('the line under an answer is a button: it looks quiet, answers to the pointer, and opens "Kam dál"', async ({
+	page
+}) => {
+	await loadCourse(page);
+	const rows = page.locator('.answers .row');
+	// Answer b leads to step 3 in the fixture, and its line says so.
+	const summary = rows.nth(1).locator('.set-values');
+	await expect(summary).toContainText('Krok 3');
+	await expect(summary).toHaveJSProperty('tagName', 'BUTTON');
+	const resting = await summary.evaluate((el) => getComputedStyle(el).backgroundColor);
+	await summary.hover();
+	await expect
+		.poll(() => summary.evaluate((el) => getComputedStyle(el).textDecorationLine))
+		.toBe('underline');
+	expect(await summary.evaluate((el) => getComputedStyle(el).backgroundColor)).not.toBe(resting);
+
+	// One click: the detail line is open and the cursor is on "Kam dál".
+	await summary.click();
+	await expect(rows.nth(1).locator('.set-values')).toHaveCount(0);
+	await expect(rows.nth(1).getByRole('group', { name: 'Podrobnosti odpovědi' })).toBeVisible();
+	await expect(
+		rows.nth(1).getByRole('button', { name: 'Kam pokračovat po této odpovědi' })
+	).toBeFocused();
+	// The chevron is still there to fold the line away.
+	await expect(rows.nth(1).getByRole('button', { name: /^Podrobnosti odpovědi/ })).toHaveAttribute(
+		'aria-expanded',
+		'true'
+	);
+});
+
+test('the "Kam dál" box opens below its button, not over the answers above it', async ({
+	page
+}) => {
+	await loadCourse(page);
+	await page.locator('.answers .row').nth(1).locator('.set-values').click();
+	const trigger = goTo(page).first();
+	await trigger.click();
+	const box = goToBox(page);
+	await expect(box).toBeVisible();
+	const t = (await trigger.boundingBox())!;
+	const b = (await box.boundingBox())!;
+	expect(b.y).toBeGreaterThanOrEqual(t.y + t.height - 1);
+});
+
+test('letters typed at once after opening "Kam dál" are not lost', async ({ page }) => {
+	await loadCourse(page);
+	await page.locator('.answers .row').nth(1).locator('.set-values').click();
+	await goTo(page).first().click();
+	// No waiting: the keys follow the click as fast as they can.
+	await page.keyboard.type('Krok');
+	await expect(goToBox(page).getByRole('searchbox', { name: 'Hledat v nabídce' })).toHaveValue(
+		'Krok'
+	);
+});
+
+test('an answer that cuts a step off says so once, and "Vrátit zpět" brings it back', async ({
+	page
+}) => {
+	await loadCourse(page);
+	const rows = page.locator('.answers .row');
+	const line = page.locator('.answers .cut-off');
+	// Answer b is the only way to step 3; sending it to the end leaves step 3 without a path.
+	await rows.nth(1).locator('.set-values').click();
+	await goTo(page).first().click();
+	await goToBox(page).getByRole('button', { name: 'Ukončit kartu' }).click();
+	await expect(line).toHaveCount(1);
+	await expect(line).toContainText('Krok 3 teď nikam nevede — žák ho neuvidí');
+	await expect(rows.nth(1).locator('.cut-off')).toBeVisible();
+
+	// Undo is this change only: the answer leads to step 3 again and the line is gone.
+	await line.getByRole('button', { name: 'Vrátit zpět' }).click();
+	await expect(line).toHaveCount(0);
+	await expect(goTo(page).first()).toContainText('Krok 3');
+
+	// Do it again; the next edit of anything clears the line.
+	await goTo(page).first().click();
+	await goToBox(page).getByRole('button', { name: 'Ukončit kartu' }).click();
+	await expect(line).toHaveCount(1);
+	await page.getByRole('textbox', { name: 'Text odpovědi' }).first().click();
+	await page.keyboard.type('x');
+	await expect(line).toHaveCount(0);
+});
+
+test('a change that loses nothing says nothing', async ({ page }) => {
+	await loadCourse(page);
+	await page.locator('.answers .row').nth(1).locator('.set-values').click();
+	await goTo(page).first().click();
+	// Carrying on from answer b reaches step 3 by the step order, so nothing is lost.
+	await goToBox(page).getByRole('button', { name: 'Pokračovat dál' }).click();
+	await expect(page.locator('.answers .cut-off')).toHaveCount(0);
+});

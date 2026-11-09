@@ -1,0 +1,232 @@
+<script lang="ts">
+	/**
+	 * Everything about a card that the student does not read.
+	 *
+	 * The split is deliberate and it is the whole reason this file exists. A card's
+	 * *content* — its steps, with their own hint and help — stays in the editor
+	 * column, always visible, because that is what the author came to write. Its
+	 * *configuration* — how long it takes, whether it joins daily practice, what it
+	 * trains, the machinery underneath — lives here, one click away. So does the
+	 * card-wide hint and help: the app only falls back to them when a step has none,
+	 * and at the bottom of the column they read as a stray extra step.
+	 *
+	 * Which settings exist is still decided by the mode, from `$lib/ui/fields.ts`, and
+	 * so is where each one sits: in sections named by what they do (`SECTIONS`), which
+	 * `SettingsNav` lists down the left from Metodik up. It renders those tables rather
+	 * than keeping a second opinion about either.
+	 */
+	import type { Snippet } from 'svelte';
+	import type { BlockV2, CourseV2, LessonBlockBinding } from '$lib/domain/schema';
+	import Modal from '$lib/ui/Modal.svelte';
+	import Button from '$lib/ui/Button.svelte';
+	import FieldGroup from '$lib/ui/FieldGroup.svelte';
+	import SettingsNav from '$lib/ui/SettingsNav.svelte';
+	import TopicPicker from './TopicPicker.svelte';
+	import CompetencyEditor from './CompetencyEditor.svelte';
+	import ConceptsEditor from './ConceptsEditor.svelte';
+	import PrerequisiteEditor from './PrerequisiteEditor.svelte';
+	import { useStore } from '$lib/ui/context';
+	import { fieldsFor, listsSections, sectionsFor, type FieldLevel } from '$lib/ui/fields';
+	import { sectionHasIssue, sectionTargeted } from '$lib/ui/settings-target';
+	import { SettingsSearch, setSettingsSearch } from '$lib/ui/settings-search.svelte';
+	import { setField, setPractice } from '$lib/domain/commands';
+	import { bindingFlagsPractice, isPracticeBlock } from '$lib/domain/derive';
+
+	interface Props {
+		doc: CourseV2;
+		block: BlockV2;
+		/** Absent for a card that is in no lesson — it then has no binding to edit. */
+		binding?: LessonBlockBinding;
+		lessonId?: string;
+		onclose: () => void;
+	}
+	let { doc, block, binding, lessonId, onclose }: Props = $props();
+
+	const store = useStore();
+	const mode = $derived(store.mode);
+
+	const blockFields = $derived(fieldsFor('block', mode, store.showFeedback));
+	const inSection = (id: string) => blockFields.filter((f) => f.section === id);
+	const bindingFields = $derived(
+		binding === undefined ? [] : fieldsFor('binding', mode, store.showFeedback)
+	);
+	/**
+	 * The card's sections, and the lesson's binding as one more just before the card's
+	 * details: it is about this card, but only where this lesson shows it.
+	 */
+	const sections = $derived.by(() => {
+		const own = sectionsFor('block', mode, store.showFeedback);
+		const lesson = bindingFields.length > 0 ? sectionsFor('binding', mode, store.showFeedback) : [];
+		const at = own.findIndex((s) => s.id === 'meta');
+		return at === -1 ? [...own, ...lesson] : [...own.slice(0, at), ...lesson, ...own.slice(at)];
+	});
+	/**
+	 * The two groups of the review section. How often the card comes back is what an
+	 * author is sent here to change, so it comes first, the gaps leading; the memory
+	 * model's starting values are for someone who knows them, and come after.
+	 */
+	const reviewStart = $derived(
+		inSection('review').filter((f) => f.path.startsWith('fsrs.initial_'))
+	);
+	const GAPS_FIRST = ['fsrs.min_interval', 'fsrs.max_interval'];
+	const reviewPlan = $derived(
+		inSection('review')
+			.filter((f) => !f.path.startsWith('fsrs.initial_'))
+			.sort((a, b) => Number(GAPS_FIRST.includes(b.path)) - Number(GAPS_FIRST.includes(a.path)))
+	);
+
+	/**
+	 * Said once for the whole section, from the same `unread` flag the spec check holds:
+	 * the fields the app reads today, named, so the line cannot go stale.
+	 */
+	const reviewNote = $derived.by(() => {
+		const fields = inSection('review');
+		if (!fields.some((f) => f.unread)) return undefined;
+		const used = fields.filter((f) => !f.unread).map((f) => `„${f.label}“`);
+		const names = used.length > 1 ? `${used.slice(0, -1).join(', ')} a ${used.at(-1)}` : used[0];
+		return used.length === 0
+			? 'Aplikace zatím nepoužívá žádnou z těchto hodnot.'
+			: `Aplikace zatím používá jen ${names}.`;
+	});
+
+	const levelOf = (id: string): FieldLevel => (id === 'lesson' ? 'binding' : 'block');
+	const scope = $derived({ blockId: block.block_id });
+	const targeted = (id: string) => sectionTargeted(store, [levelOf(id)], id, scope);
+	const alert = (id: string) => sectionHasIssue(store, [levelOf(id)], id, scope);
+
+	const search = new SettingsSearch(
+		() => (binding === undefined ? ['block'] : ['block', 'binding']),
+		() => ({
+			mode: store.mode,
+			feedback: store.showFeedback
+		})
+	);
+	setSettingsSearch(search);
+
+	/**
+	 * Whether the card is in practice, however it got there: the block, a step or a
+	 * lesson's binding (`isPracticeBlock`). The switch shows this, not the block's
+	 * own flag, so it never disagrees with the „Opakování“ chip on the card.
+	 */
+	const practice = $derived(isPracticeBlock(block, bindingFlagsPractice(doc, block.block_id)));
+
+	const set = (field: string, value: unknown) =>
+		store.apply((d) =>
+			field === 'default_practice'
+				? setPractice(d, block.block_id, value === true)
+				: setField(d, { blockId: block.block_id, field }, value)
+		);
+	const setBinding = (field: string, value: unknown) =>
+		store.apply((d) => setField(d, { lessonId, blockId: block.block_id, field }, value));
+
+	function read(path: string): unknown {
+		if (path === 'default_practice') return practice;
+		return path
+			.split('.')
+			.reduce<unknown>(
+				(node, key) =>
+					node === undefined || node === null ? undefined : (node as Record<string, unknown>)[key],
+				block as unknown
+			);
+	}
+	const readBinding = (path: string): unknown =>
+		(binding as Record<string, unknown> | undefined)?.[path];
+</script>
+
+{#snippet pane(id: string)}
+	{#if id === 'main'}
+		<div class="main">
+			<FieldGroup fields={inSection('main')} {read} write={set} />
+		</div>
+	{:else if id === 'ladder'}
+		<p class="note">Použije se u kroků, které nemají nápovědu vlastní.</p>
+		<FieldGroup fields={inSection('ladder')} {read} write={set} />
+	{:else if id === 'topics'}
+		<h4>Dovednosti</h4>
+		<TopicPicker {block} />
+		<h4 class="apart">Zařazení karty</h4>
+		<ConceptsEditor {block} />
+		<CompetencyEditor {block} />
+		<FieldGroup fields={inSection('topics')} {read} write={set} />
+	{:else if id === 'review'}
+		{#if reviewNote}<p class="note">{reviewNote}</p>{/if}
+		<h4>Kdy se karta vrací</h4>
+		<FieldGroup fields={reviewPlan} {read} write={set} />
+		<h4 class="apart">Výchozí odhad paměti</h4>
+		<FieldGroup fields={reviewStart} {read} write={set} />
+	{:else if id === 'followup'}
+		<PrerequisiteEditor {doc} {block} />
+		<FieldGroup fields={inSection('followup')} {read} write={set} />
+	{:else if id === 'lesson'}
+		<FieldGroup fields={bindingFields} read={readBinding} write={setBinding} />
+	{:else if id === 'meta'}
+		<div class="row">
+			<span class="label">Identifikátor</span>
+			<code>{block.block_id}</code>
+		</div>
+		<FieldGroup fields={inSection('meta')} {read} write={set} />
+	{/if}
+{/snippet}
+
+{#snippet body()}
+	<SettingsNav
+		{sections}
+		list={listsSections(mode)}
+		{targeted}
+		{alert}
+		levels={binding === undefined ? ['block'] : ['block', 'binding']}
+		{search}
+		{pane}
+	/>
+{/snippet}
+
+{#snippet actions(notice: Snippet)}
+	{@render notice()}
+	<Button variant="secondary" onclick={onclose}>Hotovo</Button>
+{/snippet}
+
+<Modal title="Nastavení karty" size="l" {onclose} children={body} footer={actions} />
+
+<style>
+	.main {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+	}
+
+	h4 {
+		margin: 4px 0 0;
+		color: var(--e-text-faint);
+		font-size: var(--text-xs);
+		font-weight: var(--weight-medium);
+	}
+
+	/* A second group in one section: set off from the first by space, not a rule. */
+	h4.apart {
+		margin-top: 14px;
+	}
+
+	.note {
+		margin: 0;
+		color: var(--e-text-faint);
+		font-size: var(--text-xs);
+	}
+
+	.row {
+		display: grid;
+		grid-template-columns: 160px 1fr;
+		gap: 12px;
+		align-items: start;
+	}
+
+	.label {
+		color: var(--e-text-muted);
+		font-size: var(--text-s);
+	}
+
+	code {
+		font-family: var(--font-code);
+		font-size: var(--text-s);
+		color: var(--e-text-faint);
+	}
+</style>

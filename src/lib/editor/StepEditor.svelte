@@ -1,0 +1,1154 @@
+<script lang="ts">
+	/**
+	 * One step of a block. The controls follow the step type (§7.1), and the question
+	 * controls follow the question type (§8.3) — the author never picks a renderer,
+	 * they pick what they are adding.
+	 */
+	import type {
+		BlockStep,
+		BlockV2,
+		CourseV2,
+		QuestionConfig,
+		QuestionType
+	} from '$lib/domain/schema';
+	import FocusField from '$lib/ui/FocusField.svelte';
+	import { countOf, focusAdded, focusAfterDelete } from '$lib/ui/focus-after';
+	import NumberField from '$lib/ui/NumberField.svelte';
+	import RichField from '$lib/ui/RichField.svelte';
+	import { ALWAYS_MARKDOWN, SNIFFED } from '$lib/domain/markdown';
+	import Chip from '$lib/ui/Chip.svelte';
+	import Segmented from '$lib/ui/Segmented.svelte';
+	import Toggle from '$lib/ui/Toggle.svelte';
+	import Modal from '$lib/ui/Modal.svelte';
+	import AnswerTable from './AnswerTable.svelte';
+	import FieldGroup from '$lib/ui/FieldGroup.svelte';
+	import CriteriaEditor from './CriteriaEditor.svelte';
+	import { useStepView, useStore } from '$lib/ui/context';
+	import { dragHandle } from 'svelte-dnd-action';
+	import { tick, untrack } from 'svelte';
+	import { refKey } from '$lib/domain/ref';
+	import { mediaPositionApplies } from '$lib/domain/media';
+	import { questionSettingApplies } from '$lib/domain/question-settings';
+	import Button from '$lib/ui/Button.svelte';
+	import { allows, fieldSpec, fieldsFor } from '$lib/ui/fields';
+	import { answersCount } from '$lib/ui/plural';
+	import {
+		CommandError,
+		deleteStep,
+		duplicateStep,
+		planDeleteStep,
+		setAllowMultiple,
+		setField,
+		setQuestionType,
+		moveStep
+	} from '$lib/domain/commands';
+	import {
+		Check,
+		ChevronDown,
+		ArrowDown,
+		ArrowUp,
+		ChevronRight,
+		Ellipsis,
+		Copy,
+		CornerDownRight,
+		GripVertical,
+		Grid2X2,
+		Hash,
+		PencilLine,
+		Trash
+	} from '@lucide/svelte';
+	import type { Component } from 'svelte';
+	import { appShowsFeedback } from '$lib/domain/course-feedback';
+	import { hintOfferedSteps } from '$lib/domain/hint-reach';
+	import { stepPracticeOffered, stepSummary } from '$lib/domain/derive';
+	import SettingsSection from '$lib/ui/SettingsSection.svelte';
+	import { sectionTargeted } from '$lib/ui/settings-target';
+	import { STEP_TYPES } from '$lib/lang';
+	import { withUndoNotice } from './undo-notice';
+	import Menu from '$lib/ui/Menu.svelte';
+	import MenuItem from '$lib/ui/MenuItem.svelte';
+	import { fade } from 'svelte/transition';
+
+	interface Props {
+		doc: CourseV2;
+		block: BlockV2;
+		step: BlockStep;
+		/**
+		 * The step's key in the list: its id, unless the document is broken and the id
+		 * is not unique (`ui/keys.ts`). Folding is remembered under it.
+		 */
+		stepKey: string;
+		/** The lesson the card is open in, so that focusing a step keeps it there. */
+		lessonId?: string;
+		/** 1-based position, for the label a teacher sees instead of the id (§8). */
+		position: number;
+		/** A press on the drag handle, before the drag begins (`CardEditor.grab`). */
+		ongrab: (handle: HTMLElement) => void;
+		onrepair: (blockId: string, stepId: string) => void;
+	}
+	let { doc, block, step, stepKey, lessonId, position, ongrab, onrepair }: Props = $props();
+
+	const store = useStore();
+	const mode = $derived(store.mode);
+	/** Ids key a student's saved answers, so only the advanced mode ever shows one. */
+	const showIds = $derived(allows('step', 'id', mode));
+	const typeInfo = $derived(STEP_TYPES.find((t) => t.type === step.type));
+	/**
+	 * Zpětná vazba (`store.showFeedback`): what the pupil is told aside from the
+	 * question — the solution, the hint and help ladder, and whatever `fieldsFor`
+	 * would add of the same kind — is not drawn while it is off.
+	 */
+	const feedbackOn = $derived(store.showFeedback);
+	/** A test course without evaluation: the app drops the solution and the answers' feedback. */
+	const graded = $derived(appShowsFeedback(doc));
+	const showSolution = $derived(allows('question', 'solution', mode, feedbackOn, graded));
+	const showLadder = $derived(allows('step', 'hint', mode, feedbackOn));
+	const issues = $derived(store.issuesAt({ blockId: block?.block_id, stepId: step?.id }));
+	/**
+	 * "This card has no text" is addressed to the card, but the place to fix it is an
+	 * empty text step — so that is where it shows, once the card has been left.
+	 */
+	const missingText = $derived(
+		step?.type === 'text' && (step.content ?? '').trim() === ''
+			? store
+					.issuesAt({ blockId: block?.block_id })
+					.errors.find((issue) => issue.code === 'E_DISPLAY_NO_TEXT')
+			: undefined
+	);
+
+	/** Reads a dotted path off the step, for the generic renderer. */
+	function read(path: string): unknown {
+		return path
+			.split('.')
+			.reduce<unknown>(
+				(node, key) =>
+					node === undefined || node === null ? undefined : (node as Record<string, unknown>)[key],
+				step as unknown
+			);
+	}
+	const readQuestion = (path: string): unknown =>
+		path
+			.split('.')
+			.reduce<unknown>(
+				(node, key) =>
+					node === undefined || node === null ? undefined : (node as Record<string, unknown>)[key],
+				step.question as unknown
+			);
+	const setQuestion = (path: string, value: unknown) => set(`question.${path}`, value);
+
+	/**
+	 * Fields rendered by hand above, in the place the author is already looking.
+	 *
+	 * `hint` and `help` are in here because they are *content* — the two rungs of the
+	 * ladder the app's question mark climbs, and the app needs both to have anything
+	 * to show when a pupil says "nerozumím tomu". They were behind a disclosure and,
+	 * for `help`, behind advanced mode; a teacher could ship a course whose help
+	 * button led nowhere and never see the field that would have filled it.
+	 */
+	const INLINE_STEP = [
+		'content',
+		'image.url',
+		'image.alt',
+		'video.url',
+		'audio.url',
+		'hint',
+		'help'
+	];
+	const INLINE_QUESTION = [
+		'correct_answer',
+		'correct_number',
+		'tolerance',
+		'allow_multiple',
+		'solution'
+	];
+
+	/**
+	 * What is left over: settings rather than content. In teacher mode both lists are
+	 * empty, which is the point — nothing in this editor needs expanding to be found.
+	 */
+	const extraFields = $derived(
+		fieldsFor('step', mode, feedbackOn, graded).filter(
+			(f) =>
+				!INLINE_STEP.includes(f.path) &&
+				// The step's switch only duplicates the card's own when the card is in practice.
+				(f.path !== 'default_practice' || stepPracticeOffered(doc, block, step)) &&
+				// Where a picture or video sits matters only around a text step's text.
+				(f.path !== 'image.position' || mediaPositionApplies(step, 'image')) &&
+				(f.path !== 'video.position' || mediaPositionApplies(step, 'video'))
+		)
+	);
+	// A selection or a visible issue that points into the fold opens it.
+	const extrasTargeted = $derived(
+		sectionTargeted(store, ['step', 'question'], 'extras', {
+			blockId: block.block_id,
+			stepId: step.id
+		})
+	);
+	const questionExtras = $derived(
+		fieldsFor('question', mode, feedbackOn, graded).filter(
+			(f) =>
+				!INLINE_QUESTION.includes(f.path) &&
+				(step.question === undefined || questionSettingApplies(step.question, f.path))
+		)
+	);
+
+	const criteriaSpec = fieldSpec('question', 'ai_criteria_list');
+	const criteriaShown = $derived(
+		step.question !== undefined &&
+			allows('question', 'ai_criteria_list', mode) &&
+			questionSettingApplies(step.question, 'ai_criteria_list')
+	);
+
+	const hintSpec = fieldSpec('step', 'hint');
+	const helpSpec = fieldSpec('step', 'help');
+	const multipleSpec = fieldSpec('question', 'allow_multiple');
+
+	/**
+	 * Whether the app's question mark can ever open this step's hint. A question or
+	 * exercise card only stops on its questions; the text between them is never the
+	 * step on screen, so the ladder is not offered there. A hint already written on
+	 * such a step is still shown, with `W_HINT_UNREACHABLE` under it, so it can be
+	 * moved or deleted.
+	 */
+	const ladderReached = $derived(hintOfferedSteps(block).includes(step));
+	const ladderShown = $derived(
+		ladderReached || (step.hint ?? '').trim() !== '' || (step.help ?? '').trim() !== ''
+	);
+	const cardHasHint = $derived((block.hint ?? '').trim() !== '');
+
+	const set = (field: string, value: unknown) =>
+		store.apply((d) => setField(d, { blockId: block.block_id, stepId: step.id, field }, value));
+
+	const QUESTION_TYPES: {
+		value: QuestionType;
+		label: string;
+		title: string;
+		icon: Component;
+	}[] = [
+		{
+			value: 'multiple_choice',
+			label: 'Výběr',
+			title: 'Žák vybírá z možností',
+			icon: Grid2X2
+		},
+		{
+			value: 'true_false',
+			label: 'Ano/Ne',
+			title: 'Dvě velká tlačítka — rychlé na procvičování',
+			icon: Check
+		},
+		{
+			value: 'open',
+			label: 'Otevřená odpověď',
+			title: 'Žák píše odpověď; vyhodnotí ji AI',
+			icon: PencilLine
+		},
+		{
+			value: 'numeric',
+			label: 'Číslo',
+			title: 'Žák zadává číslo; vyhodnocuje se s tolerancí',
+			icon: Hash
+		}
+	];
+
+	/**
+	 * What `setQuestionType` (commands.ts) would throw away by switching to `target`,
+	 * counted only in things a teacher actually put there. A freshly scaffolded
+	 * question (`emptyQuestion()`: two options, no text, no feedback, no branching) is
+	 * indistinguishable from "nothing to lose" here on purpose — the option ids and the
+	 * default `is_correct` are the type's own bookkeeping, not authored content, so
+	 * switching an untouched question never nags. `null` means "apply straight away".
+	 */
+	interface TypeChangeLoss {
+		answers: number;
+		withFeedback: number;
+		withBranching: number;
+		correctAnswer?: string;
+		correctNumber?: string;
+	}
+
+	function planQuestionTypeChange(
+		question: QuestionConfig | undefined,
+		target: QuestionType
+	): TypeChangeLoss | null {
+		if (question === undefined || question.type === target) return null;
+
+		// Mirrors setQuestionType's own branches: true_false always replaces options,
+		// open/numeric drop them, and multiple_choice only replaces them when there
+		// were fewer than two to begin with (the scaffolded state).
+		const optionsReplaced =
+			target === 'true_false' ||
+			target === 'open' ||
+			target === 'numeric' ||
+			(target === 'multiple_choice' && (question.options?.length ?? 0) < 2);
+
+		const authored = optionsReplaced
+			? (question.options ?? []).filter(
+					(o) => o.text.trim() !== '' || !!o.feedback?.trim() || !!o.go_to
+				)
+			: [];
+
+		const loss: TypeChangeLoss = {
+			answers: authored.length,
+			withFeedback: authored.filter((o) => !!o.feedback?.trim()).length,
+			withBranching: authored.filter((o) => !!o.go_to).length
+		};
+		if (target !== 'open' && question.type === 'open' && question.correct_answer?.trim()) {
+			loss.correctAnswer = question.correct_answer;
+		}
+		if (
+			target !== 'numeric' &&
+			question.type === 'numeric' &&
+			question.correct_number !== undefined
+		) {
+			loss.correctNumber =
+				question.tolerance !== undefined
+					? `${question.correct_number} (tolerance ±${question.tolerance})`
+					: String(question.correct_number);
+		}
+
+		const nothingLost =
+			loss.answers === 0 && loss.correctAnswer === undefined && loss.correctNumber === undefined;
+		return nothingLost ? null : loss;
+	}
+
+	function typeChangeMessage(loss: TypeChangeLoss): string {
+		const parts: string[] = [];
+		if (loss.answers > 0) {
+			const extras: string[] = [];
+			if (loss.withFeedback > 0) extras.push(`${loss.withFeedback} s vysvětlením pro žáka`);
+			if (loss.withBranching > 0) extras.push(`${loss.withBranching} s větvením na jiný krok`);
+			const suffix = extras.length > 0 ? ` (z toho ${extras.join(', ')})` : '';
+			parts.push(`smaže ${answersCount(loss.answers)}${suffix}`);
+		}
+		if (loss.correctAnswer !== undefined) {
+			parts.push(`smaže zadanou správnou odpověď „${loss.correctAnswer}“`);
+		}
+		if (loss.correctNumber !== undefined) {
+			parts.push(`smaže zadaný správný výsledek ${loss.correctNumber}`);
+		}
+		return `Tato změna ${parts.join(' a ')}. Vrátit to jde tlačítkem Vrátit v liště.`;
+	}
+
+	let pendingTypeChange = $state<{
+		type: QuestionType;
+		loss: TypeChangeLoss;
+	} | null>(null);
+
+	function requestQuestionType(type: QuestionType) {
+		const loss = planQuestionTypeChange(step.question, type);
+		if (loss === null) {
+			store.apply((d) => setQuestionType(d, block.block_id, step.id, type));
+		} else {
+			pendingTypeChange = { type, loss };
+		}
+	}
+
+	function confirmQuestionTypeChange() {
+		if (pendingTypeChange === null) return;
+		store.apply((d) => setQuestionType(d, block.block_id, step.id, pendingTypeChange!.type));
+		pendingTypeChange = null;
+	}
+
+	function cancelQuestionTypeChange() {
+		pendingTypeChange = null;
+	}
+
+	/**
+	 * The `<img>`/`<video>`/`<audio>` preview must not re-fetch on every keystroke, but
+	 * it must not lag behind a change the author didn't type either — undo, import and
+	 * opening a different step replace the whole url at once and should show up right
+	 * away. `type()` is called from the field's own `onchange`, so it stamps `pending`
+	 * before the store round-trips back into `step`'s prop; the effect below then reads
+	 * "this echo matches what I just typed, the debounce already has it" from "this
+	 * wasn't typed here, show it now" by comparing against that stamp.
+	 */
+	function debouncedMediaPreview(read: () => string | undefined) {
+		let preview = $state(read());
+		let pending: string | undefined;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		$effect(() => {
+			const current = read();
+			if (current === pending) return;
+			clearTimeout(timer);
+			pending = current;
+			preview = current;
+		});
+		return {
+			get value() {
+				return preview;
+			},
+			/** Called on every keystroke; settles into the preview after a short pause. */
+			type(v: string | undefined) {
+				pending = v;
+				clearTimeout(timer);
+				timer = setTimeout(() => {
+					preview = v;
+				}, 450);
+			},
+			/** Called on blur — no reason to make the teacher wait once they've moved on. */
+			flush(v: string | undefined) {
+				pending = v;
+				clearTimeout(timer);
+				preview = v;
+			}
+		};
+	}
+
+	const imagePreview = debouncedMediaPreview(() => step.image?.url);
+	const videoPreview = debouncedMediaPreview(() => step.video?.url);
+	const audioPreview = debouncedMediaPreview(() => step.audio?.url);
+
+	/** §14 E_MEDIA_NOT_DIRECT mirrors this same check — kept here too so the field can
+	 *  explain the mistake before validation ever runs, not only after. */
+	const VIDEO_PAGE_URL = /youtube\.com|youtu\.be|vimeo\.com/i;
+	const videoIsPageLink = $derived(VIDEO_PAGE_URL.test(step.video?.url ?? ''));
+
+	/** The card's list of steps, as `CardEditor` draws it. */
+	const STEPS = ':scope > .step-wrap';
+
+	/** The header's measured height; a folded step is exactly that plus `FOLDED_CHROME`. */
+	let headerHeight = $state(25);
+	/** The step's vertical padding (2 × 12px) and border (2 × 1px). */
+	const FOLDED_CHROME = 26;
+
+	function remove() {
+		const list = root?.closest('.steps') ?? null;
+		const before = countOf(list, STEPS);
+		const at = place;
+		try {
+			withUndoNotice(
+				store,
+				'Krok smazán.',
+				() => store.apply((d) => deleteStep(d, block.block_id, step.id)),
+				{ lessonId: store.selection?.lessonId, blockId: block.block_id, stepId: step.id }
+			);
+			void focusAfterDelete(list, STEPS, at, before, () =>
+				list?.parentElement?.querySelector<HTMLElement>('.add-step button')
+			);
+		} catch (error) {
+			if (error instanceof CommandError) onrepair(block.block_id, step.id);
+			else throw error;
+		}
+	}
+
+	function duplicate() {
+		const list = root?.closest('.steps') ?? null;
+		const at = place + 1;
+		store.apply((d, r) => duplicateStep(d, block.block_id, step.id, r));
+		void focusAdded(list, STEPS, at);
+	}
+
+	const inboundBranches = $derived(planDeleteStep(doc, block.block_id, step.id).length);
+
+	// Highlight and scroll to this step when something outside the editor points at
+	// it — a click in the preview, a jump from the validation panel.
+	let root = $state<HTMLElement | null>(null);
+	// Optional access, not defensiveness for its own sake: when a card is deleted the
+	// selection moves in an effect, which flushes before this component is destroyed,
+	// so the derived runs once more with the props already torn down.
+	const targeted = $derived(
+		store.selection?.blockId === block?.block_id && store.selection?.stepId === step?.id
+	);
+	$effect(() => {
+		// Depends on the reveal counter, not on the selection: typing also moves the
+		// selection, and scrolling on every keystroke would be unusable. A reveal is
+		// answered once — this step may remount afterwards (a drag remounts it twice)
+		// and must not pull the page back to itself when it does.
+		const reveal = store.reveal;
+		if (!targeted || root === null) return;
+		if (untrack(() => stepView.revealHandled) === reveal) return;
+		stepView.revealHandled = reveal;
+		root.scrollIntoView({ block: 'center', behavior: 'smooth' });
+	});
+
+	/**
+	 * Open or folded is decided in one place (`ui/step-expansion.ts`) from state that
+	 * outlives this component (`state/step-view.svelte.ts`): the author's chevron,
+	 * whether the selection is here, and whether a step is being dragged.
+	 */
+	const stepView = useStepView();
+	const collapsed = $derived(
+		block !== undefined &&
+			step !== undefined &&
+			!stepView.expanded(block.block_id, stepKey, step.id, store.selection)
+	);
+
+	const place = $derived(block.steps.findIndex((s) => s.id === step.id));
+
+	/** One place up or down — the buttons' and the handle's arrow keys' version of a drag. */
+	async function move(delta: -1 | 1) {
+		const to = place + delta;
+		if (place < 0 || to < 0 || to >= block.steps.length) return;
+		const focusGrip = root?.contains(document.activeElement) ?? false;
+		store.apply((d) => moveStep(d, block.block_id, step.id, delta));
+		// Moving a node in the DOM can drop its focus; give it back to the same handle.
+		if (focusGrip) {
+			await tick();
+			root?.querySelector<HTMLElement>('.grip')?.focus();
+		}
+	}
+
+	/**
+	 * The press on the handle, as a listener on the handle itself. A delegated
+	 * `onmousedown` never arrives: `svelte-dnd-action` handles the same press on the
+	 * step's wrapper, below the root where Svelte listens, and stops it there.
+	 */
+	function grabbed(handle: HTMLElement) {
+		const press = () => ongrab(handle);
+		const key = (event: KeyboardEvent) => {
+			if (event.key === 'Enter' || event.key === ' ') ongrab(handle);
+			else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+				event.preventDefault();
+				event.stopPropagation();
+				move(event.key === 'ArrowUp' ? -1 : 1);
+			}
+		};
+		handle.addEventListener('mousedown', press);
+		handle.addEventListener('touchstart', press);
+		handle.addEventListener('keydown', key);
+		return {
+			destroy() {
+				handle.removeEventListener('mousedown', press);
+				handle.removeEventListener('touchstart', press);
+				handle.removeEventListener('keydown', key);
+			}
+		};
+	}
+
+	/**
+	 * Working in a step focuses it: the selection moves here, which is what opens a
+	 * folded step, outlines it in the preview, and folds it again once the author
+	 * moves on. Only the body counts — the header's buttons act on the step without
+	 * being "in" it, and the drag handle must not open the step it is moving.
+	 */
+	function focusStep() {
+		const selection = store.selection;
+		if (selection?.blockId === block.block_id && selection?.stepId === step.id) return;
+		store.selection = {
+			...(lessonId !== undefined ? { lessonId } : {}),
+			blockId: block.block_id,
+			stepId: step.id
+		};
+	}
+</script>
+
+<article
+	bind:this={root}
+	class="step"
+	class:invalid={issues.errors.length > 0}
+	class:targeted
+	class:collapsed
+	class:folding-to-drag={stepView.dragging}
+	style:--folded-height={headerHeight > 0 ? `${headerHeight + FOLDED_CHROME}px` : undefined}
+>
+	<header bind:offsetHeight={headerHeight}>
+		<button
+			type="button"
+			class="grip"
+			use:dragHandle
+			aria-label="Přesunout krok {position}"
+			title="Přetažením (nebo šipkami nahoru a dolů) změníš pořadí kroků"
+			use:grabbed
+		>
+			<GripVertical size={16}></GripVertical>
+		</button>
+		<Chip
+			tone="quiet"
+			title={collapsed ? 'Rozbalit krok' : 'Sbalit krok'}
+			onclick={() => stepView.toggle(block.block_id, stepKey, step.id, store.selection)}
+		>
+			{#if collapsed}
+				<ChevronRight size={16}></ChevronRight>
+			{:else}
+				<ChevronDown size={16}></ChevronDown>
+			{/if}
+		</Chip>
+
+		<!--
+            One quiet fact instead of two chips: what kind of step, and which. "Krok N"
+            stays in its own span — a teacher finds a step by its place, and never sees
+            an id (§8), which only the advanced mode shows in its place.
+        -->
+		<Chip tone="quiet" title={showIds ? 'Identifikátor kroku' : undefined}>
+			{#if typeInfo}
+				{@const Icon = typeInfo.icon}
+				<Icon size={14}></Icon>
+			{/if}
+			<span>{showIds ? step.id : `Krok ${position}`}</span>
+			{#if typeInfo}<span> · {typeInfo.label}</span>{/if}
+		</Chip>
+		{#if inboundBranches > 0}
+			<Chip tone="accent" title="Na tento krok vede větvení z jiné odpovědi">
+				<CornerDownRight size={14}></CornerDownRight>
+				{inboundBranches}
+			</Chip>
+		{/if}
+
+		{#if collapsed}
+			<!-- Clicking the summary looks inside without unfolding for good. -->
+			<button type="button" class="summary" title="Zobrazit krok" onclick={focusStep}
+				>{stepSummary(step)}</button
+			>
+		{:else}
+			<div class="spacer"></div>
+		{/if}
+		<!-- Out of the way until the step is the one being worked on. -->
+		<div class="actions">
+			<Menu label="Další akce s krokem" icon={Ellipsis} placement="bottom-end">
+				<MenuItem icon={ArrowUp} onclick={() => move(-1)} disabled={place <= 0}>
+					Posunout nahoru
+				</MenuItem>
+				<MenuItem
+					icon={ArrowDown}
+					onclick={() => move(1)}
+					disabled={place < 0 || place >= block.steps.length - 1}
+				>
+					Posunout dolů
+				</MenuItem>
+			</Menu>
+			<Button
+				variant="ghost"
+				size="s"
+				onclick={duplicate}
+				title="Duplikovat krok"
+				ariaLabel="Duplikovat krok"
+			>
+				<Copy size={16}></Copy>
+			</Button>
+			<Button
+				variant="danger"
+				size="s"
+				onclick={remove}
+				title="Smazat krok"
+				ariaLabel="Smazat krok"
+			>
+				<Trash size={16}></Trash>
+			</Button>
+		</div>
+	</header>
+
+	{#if !collapsed}
+		<div
+			class="body"
+			role="group"
+			aria-label="Obsah kroku {position}"
+			onfocusin={focusStep}
+			onpointerdown={focusStep}
+			out:fade={{ duration: stepView.dragging ? 0 : 200 }}
+		>
+			{#if step.type === 'text'}
+				<RichField
+					label="Text kroku"
+					value={step.content}
+					dialect={SNIFFED}
+					emptyText="Napiš, co si má žák přečíst."
+					invalid={missingText !== undefined}
+					onchange={(v) => set('content', v)}
+				/>
+				{#if missingText}
+					<p class="missing-text">{missingText.message}</p>
+				{/if}
+			{:else if step.type === 'image'}
+				<div class="media">
+					<FocusField
+						label="Adresa obrázku"
+						value={step.image?.url}
+						emptyText="Vlož odkaz na obrázek (např. https://…/obrazek.jpg)"
+						monospace
+						onchange={(v) => {
+							set('image.url', v ?? '');
+							imagePreview.type(v ?? '');
+						}}
+						ref={{
+							blockId: block.block_id,
+							stepId: step.id,
+							field: 'image.url'
+						}}
+						onblur={() => imagePreview.flush(step.image?.url ?? '')}
+					/>
+					<!-- Nothing to describe until there is a picture. -->
+					{#if (step.image?.url ?? '') !== ''}
+						<FocusField
+							label="Popis obrázku pro čtečku obrazovky"
+							value={step.image?.alt}
+							emptyText="Popiš, co je na obrázku — přečte to čtečka obrazovky"
+							ref={{
+								blockId: block.block_id,
+								stepId: step.id,
+								field: 'image.alt'
+							}}
+							onchange={(v) => set('image.alt', v)}
+						/>
+					{/if}
+					{#if imagePreview.value}
+						<img src={imagePreview.value} alt={step.image?.alt ?? ''} />
+					{/if}
+				</div>
+			{:else if step.type === 'video'}
+				<div class="media">
+					<FocusField
+						label="Adresa videa"
+						value={step.video?.url}
+						emptyText="https://… přímý odkaz na MP4 (YouTube a Vimeo přehrávač nenačte)"
+						monospace
+						onchange={(v) => {
+							set('video.url', v ?? '');
+							videoPreview.type(v ?? '');
+						}}
+						ref={{
+							blockId: block.block_id,
+							stepId: step.id,
+							field: 'video.url'
+						}}
+						onblur={() => videoPreview.flush(step.video?.url ?? '')}
+					/>
+					{#if videoIsPageLink}
+						<!--
+					§14 E_MEDIA_NOT_DIRECT fires on export, but by then the teacher has
+					already pasted the wrong thing and moved on. Catching it here, next to
+					the field, is what turns "proč se to nepřehrává" into a one-line fix.
+				-->
+						<p class="field-hint warning">
+							Tohle je odkaz na stránku YouTube/Vimeo, ne na video samotné — přehrávač v kurzu ho
+							nenačte. Otevři video, najdi jeho přímý soubor (.mp4) a vlož adresu toho.
+						</p>
+					{/if}
+					{#if videoPreview.value}
+						<!-- svelte-ignore a11y_media_has_caption -->
+						<video src={videoPreview.value} controls></video>
+					{/if}
+				</div>
+			{:else if step.type === 'audio'}
+				<div class="media">
+					<FocusField
+						label="Adresa zvuku"
+						value={step.audio?.url}
+						emptyText="https://… MP3, WAV nebo OGG"
+						monospace
+						onchange={(v) => {
+							set('audio.url', v ?? '');
+							audioPreview.type(v ?? '');
+						}}
+						ref={{
+							blockId: block.block_id,
+							stepId: step.id,
+							field: 'audio.url'
+						}}
+						onblur={() => audioPreview.flush(step.audio?.url ?? '')}
+					/>
+					{#if audioPreview.value}<audio src={audioPreview.value} controls></audio>{/if}
+				</div>
+			{:else if step.type === 'question'}
+				<div class="question">
+					<RichField
+						label="Zadání otázky"
+						value={step.content}
+						dialect={SNIFFED}
+						emptyText="Zadání otázky"
+						onchange={(v) => set('content', v)}
+					/>
+
+					<div class="question-type">
+						<Segmented
+							label="Typ otázky"
+							options={QUESTION_TYPES}
+							value={step.question?.type ?? 'multiple_choice'}
+							onchange={requestQuestionType}
+						/>
+					</div>
+
+					{#if step.question?.type === 'open'}
+						<div class="field-row">
+							<span class="field-label">Správná odpověď</span>
+							<FocusField
+								label="Správná odpověď"
+								value={step.question.correct_answer}
+								multiline
+								emptyText="Jedna přijatá odpověď na řádek"
+								ref={{
+									blockId: block.block_id,
+									stepId: step.id,
+									field: 'question.correct_answer'
+								}}
+								onchange={(v) => set('question.correct_answer', v)}
+							/>
+						</div>
+					{:else if step.question?.type === 'numeric'}
+						<div class="field-row">
+							<span class="field-label">Správný výsledek</span>
+							<NumberField
+								label="Správný výsledek"
+								value={step.question?.correct_number}
+								emptyText="Číslo"
+								monospace
+								ref={{
+									blockId: block.block_id,
+									stepId: step.id,
+									field: 'question.correct_number'
+								}}
+								onchange={(v) => set('question.correct_number', v)}
+							/>
+						</div>
+						<div class="field-row">
+							<span class="field-label">Tolerance ±</span>
+							<NumberField
+								label="Tolerance"
+								value={step.question?.tolerance}
+								emptyText="0 — vyžaduje přesnou shodu"
+								monospace
+								ref={{
+									blockId: block.block_id,
+									stepId: step.id,
+									field: 'question.tolerance'
+								}}
+								onchange={(v) => set('question.tolerance', v)}
+							/>
+						</div>
+					{:else}
+						<AnswerTable {doc} {block} {step} />
+						{#if step.question?.type === 'multiple_choice'}
+							<Toggle
+								label={multipleSpec?.label ?? 'Víc správných možností'}
+								hint={step.question.allow_multiple === true ? multipleSpec?.hint : undefined}
+								checked={step.question.allow_multiple === true}
+								onchange={(v) =>
+									store.apply((d) => setAllowMultiple(d, block.block_id, step.id, v))}
+							/>
+						{/if}
+					{/if}
+
+					{#if showSolution}
+						<div class="field-row">
+							<span class="field-label">Řešení</span>
+							<RichField
+								dialect={SNIFFED}
+								label="Vysvětlení řešení"
+								value={step.question?.solution}
+								ref={{
+									blockId: block.block_id,
+									stepId: step.id,
+									field: 'question.solution'
+								}}
+								emptyText="Napiš postup, ne jen výsledek — tohle je nejčtenější text v kurzu."
+								onchange={(v) => set('question.solution', v)}
+							/>
+						</div>
+					{/if}
+				</div>
+			{/if}
+
+			<!--
+		The help ladder, on screen. Two rungs: the hint narrows the search, the help
+		teaches the method. The app's question mark offers the second only after the
+		first, and shows nothing at all if these are empty.
+	-->
+			{#if showLadder && ladderShown}
+				<div class="help-ladder">
+					<!-- The consequence of each rung sits under its name, like every other field's. -->
+					<div class="field-row">
+						<div class="field-label">
+							<span>{hintSpec?.label ?? 'Nápověda'}</span>
+							{#if hintSpec?.hint}<span class="hint">{hintSpec.hint}</span>{/if}
+						</div>
+						<RichField
+							dialect={ALWAYS_MARKDOWN}
+							label={hintSpec?.label ?? 'Nápověda'}
+							value={step.hint}
+							ref={{
+								blockId: block.block_id,
+								stepId: step.id,
+								field: 'hint'
+							}}
+							emptyText={cardHasHint
+								? 'nevyplněno — otazník u tohoto kroku otevře nápovědu ke kartě'
+								: 'nevyplněno — bez nápovědy žák u tohoto kroku otazník neuvidí'}
+							onchange={(v) => set('hint', v)}
+						/>
+					</div>
+					<div class="field-row">
+						<div class="field-label">
+							<span>{helpSpec?.label ?? 'Podrobná pomoc'}</span>
+							{#if helpSpec?.hint}<span class="hint">{helpSpec.hint}</span>{/if}
+						</div>
+						<RichField
+							dialect={ALWAYS_MARKDOWN}
+							label={helpSpec?.label ?? 'Podrobná pomoc'}
+							value={step.help}
+							ref={{
+								blockId: block.block_id,
+								stepId: step.id,
+								field: 'help'
+							}}
+							emptyText="nevyplněno — druhá úroveň otazníku"
+							onchange={(v) => set('help', v)}
+						/>
+					</div>
+				</div>
+			{/if}
+
+			{#if extraFields.length > 0 || questionExtras.length > 0}
+				<div class="step-extras">
+					<SettingsSection label="Další nastavení kroku" autoOpen={extrasTargeted}>
+						<div class="extras">
+							<FieldGroup fields={extraFields} {read} write={set} />
+							{#if step.type === 'question' && questionExtras.length > 0}
+								<FieldGroup fields={questionExtras} read={readQuestion} write={setQuestion} />
+							{/if}
+							{#if criteriaShown && step.question}
+								<CriteriaEditor
+									criteria={step.question.ai_criteria_list}
+									hint={criteriaSpec?.hint}
+									ref={{
+										blockId: block.block_id,
+										stepId: step.id,
+										field: 'question.ai_criteria_list'
+									}}
+									onchange={(v) => setQuestion('ai_criteria_list', v)}
+								/>
+							{/if}
+						</div>
+					</SettingsSection>
+				</div>
+			{/if}
+
+			{#if pendingTypeChange}
+				<Modal title="Změnit typ otázky?" onclose={cancelQuestionTypeChange}>
+					<p>{typeChangeMessage(pendingTypeChange.loss)}</p>
+					{#snippet footer()}
+						<Button variant="ghost" onclick={cancelQuestionTypeChange}>Zrušit</Button>
+						<Button variant="danger-solid" onclick={confirmQuestionTypeChange}>Přesto změnit</Button
+						>
+					{/snippet}
+				</Modal>
+			{/if}
+		</div>
+	{/if}
+</article>
+
+<style>
+	.collapsed header {
+		margin-bottom: 0;
+	}
+
+	.step {
+		interpolate-size: allow-keywords;
+		transition: height 200ms ease-in-out;
+		height: calc-size(auto, size);
+		overflow: hidden;
+	}
+
+	/* The header's own height plus the step's padding and border, so a larger font or a
+	   header that wraps is not clipped (#53). */
+	.collapsed {
+		height: var(--folded-height, 51px);
+	}
+
+	/*
+	 * The fold a drag starts with is not animated. `CardEditor`'s `grab` measures how
+	 * far the fold moved the handle, and the drag library builds the carried step and
+	 * its gap from the list at the first move; mid-animation both are wrong, and the
+	 * step stays offset from the pointer and lands somewhere else. Folding with the
+	 * chevron, and opening again after the drop, still animate.
+	 */
+	.folding-to-drag {
+		transition: none;
+	}
+
+	.body {
+		animation: expand 200ms ease-out;
+	}
+
+	@keyframes expand {
+		from {
+			opacity: 0;
+		}
+		to {
+			opacity: 1;
+		}
+	}
+
+	.step {
+		padding: 12px 14px;
+		border: 1px solid var(--e-border);
+		border-radius: var(--radius-m);
+		background: var(--surface);
+	}
+
+	.step.invalid {
+		border-color: var(--e-error);
+	}
+
+	.step.targeted {
+		border-color: var(--primary);
+		box-shadow: 0 0 0 3px var(--primary-dark-12);
+	}
+
+	header {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin-bottom: 8px;
+	}
+
+	.spacer {
+		flex: 1;
+	}
+
+	.grip {
+		display: inline-flex;
+		align-items: center;
+		margin-left: -6px;
+		padding: 2px;
+		border: none;
+		border-radius: var(--radius-s);
+		background: none;
+		color: var(--e-text-faint);
+		opacity: 0.45;
+		transition: opacity 120ms;
+		cursor: grab;
+	}
+
+	.step:hover .grip,
+	.step:focus-within .grip,
+	.grip:hover,
+	.grip:focus-visible {
+		opacity: 1;
+	}
+
+	.grip:hover,
+	.grip:focus-visible {
+		color: var(--e-text);
+		background: var(--surface-light);
+	}
+
+	/*
+     * Duplicate, delete and the step's menu are faint on every step and full on the one
+     * being pointed at, typed into or targeted — as an answer's are. Invisible, a teacher
+     * had no way to know a step could be removed. A screen with no hover shows them full.
+     */
+	.actions {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		opacity: 0.45;
+		transition: opacity 120ms;
+	}
+
+	.step:hover .actions,
+	.step:focus-within .actions,
+	.step.targeted .actions {
+		opacity: 1;
+	}
+
+	@media (hover: none) {
+		.actions,
+		.grip {
+			opacity: 1;
+		}
+	}
+
+	/* The summary takes the room the spacer would, and never less than a few words. */
+	.summary {
+		overflow: hidden;
+		min-width: 6rem;
+		flex: 1 1 0;
+		padding: 0;
+		border: none;
+		background: none;
+		color: var(--e-text-muted);
+		font: inherit;
+		font-size: var(--text-s);
+		text-align: left;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		cursor: pointer;
+	}
+
+	.summary:hover {
+		color: var(--e-text);
+	}
+
+	.missing-text {
+		margin: 4px 0 0;
+		padding-left: 8px;
+		color: var(--e-error-text);
+		font-size: var(--text-xs);
+	}
+
+	.media {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+
+	.media img,
+	.media video {
+		max-width: 100%;
+		max-height: 220px;
+		border-radius: var(--radius-s);
+		object-fit: contain;
+		background: var(--surface-light);
+	}
+
+	.question,
+	.step-extras,
+	.help-ladder {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+	}
+
+	.step-extras {
+		margin-top: 10px;
+	}
+
+	.help-ladder {
+		margin-top: 14px;
+		padding-top: 10px;
+		border-top: 1px dashed var(--e-border);
+	}
+
+	.extras {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+	}
+
+	.question-type {
+		display: flex;
+	}
+
+	.field-row {
+		display: grid;
+		grid-template-columns: 170px 1fr;
+		gap: 12px;
+		align-items: start;
+		font-size: var(--text-m);
+	}
+
+	.field-label {
+		padding-top: 6px;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		color: var(--e-text-muted);
+		font-size: var(--text-s);
+	}
+
+	.hint {
+		color: var(--e-text-faint);
+		font: var(--type-meta);
+		font-weight: var(--weight-regular);
+		line-height: 1.5;
+	}
+
+	.field-hint {
+		margin: 0;
+		font-size: var(--text-xs);
+	}
+
+	.field-hint.warning {
+		color: var(--e-warning-text);
+	}
+</style>

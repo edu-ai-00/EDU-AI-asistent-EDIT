@@ -1,0 +1,240 @@
+import {
+	addStep,
+	cardAction,
+	cardActionCount,
+	cardMenu,
+	expect,
+	test,
+	type Page,
+	openEditor
+} from './fixtures';
+import { readFileSync } from 'node:fs';
+
+const course = () =>
+	JSON.parse(
+		readFileSync(
+			new URL('../src/lib/domain/__tests__/fixtures/spec-16-course.json', import.meta.url),
+			'utf8'
+		)
+	);
+
+async function load(page: Page, doc = course()) {
+	// Wait for the initial onMount document, not the SSR file input.
+	await openEditor(page);
+	await page.setInputFiles('input[type=file]', {
+		name: 'card-actions.json',
+		mimeType: 'application/json',
+		buffer: Buffer.from(JSON.stringify(doc))
+	});
+	// A modified seed course is dirty; keep it explicitly when asked.
+	page.on('dialog', (dialog) => dialog.accept());
+	await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+	await expect(page.locator('.tree-lesson.open .name')).toHaveText(doc.lessons[0].name);
+}
+
+async function exported(page: Page) {
+	const pending = page.waitForEvent('download');
+	await page.getByRole('button', { name: 'Stáhnout', exact: true }).click();
+	// An orphaned card is a warning, and warnings open the review before the file.
+	const anyway = page.getByRole('button', { name: 'Stáhnout i tak' });
+	if (await anyway.isVisible()) await anyway.click();
+	const stream = await (await pending).createReadStream();
+	const chunks: Buffer[] = [];
+	for await (const chunk of stream!) chunks.push(Buffer.from(chunk));
+	return JSON.parse(Buffer.concat(chunks).toString());
+}
+
+const REMOVE = 'Odebrat z lekce';
+const ERASE = 'Smazat kartu';
+const ASSIGN = 'Zařadit do lekce';
+
+test('unlinking creates an editable orphan; picker cancels, binds once and undoes', async ({
+	page
+}) => {
+	const doc = course();
+	await load(page, doc);
+	await cardAction(page, REMOVE);
+	await expect(page.getByRole('dialog')).toHaveCount(0);
+	await expect(page.locator('.orphans .tree-card')).toHaveCount(1);
+	await expect(page.locator('.toast')).toContainText('Karty mimo lekci');
+	expect(await cardActionCount(page, REMOVE)).toBe(0);
+	await page.getByRole('button', { name: 'Vrátit zpět', exact: true }).click();
+	await expect(page.locator('.orphans .tree-card')).toHaveCount(0);
+	await cardAction(page, REMOVE);
+	await cardAction(page, ASSIGN);
+	const dialog = page.getByRole('dialog', { name: 'Zařadit do lekce', exact: true });
+	await expect(dialog.getByRole('button', { name: 'Zařadit', exact: true })).toBeDisabled();
+	await page.keyboard.press('Escape');
+	await expect(page.locator('.orphans .tree-card')).toHaveCount(1);
+	await cardAction(page, ASSIGN);
+	await dialog
+		.getByRole('combobox', { name: 'Lekce', exact: true })
+		.selectOption(doc.lessons[0].lesson_id);
+	await dialog.getByRole('button', { name: 'Zařadit', exact: true }).click();
+	await expect(page.locator('.orphans .tree-card')).toHaveCount(0);
+	expect(await cardActionCount(page, ASSIGN)).toBe(0);
+	const result = await exported(page);
+	expect(result.blocks).toEqual(doc.blocks);
+	expect(
+		result.lessons[0].blocks.filter(
+			(b: { block_id: string }) => b.block_id === doc.blocks[0].block_id
+		)
+	).toHaveLength(1);
+	await page.getByRole('button', { name: 'Vrátit zpět', exact: true }).click();
+	await expect(page.locator('.orphans .tree-card')).toHaveCount(1);
+});
+
+test('unlinking a shared and referenced card preserves content, references and other lessons', async ({
+	page
+}) => {
+	const doc = course();
+	const id = doc.blocks[0].block_id;
+	doc.lessons.push({
+		lesson_id: 'OTHER',
+		version: 1,
+		name: 'Další lekce',
+		order: 2,
+		blocks: [{ block_id: id, order: 1 }]
+	});
+	doc.blocks[1].learning!.prerequisites = [{ block_id: id, min_level: 1 }];
+	doc.blocks[2].steps.find(
+		(s: { type: string }) => s.type === 'question'
+	).question.options[0].go_to = id;
+	await load(page, doc);
+	await cardAction(page, REMOVE);
+	await expect(page.getByRole('dialog')).toHaveCount(0);
+	await expect(page.locator('.toast')).toContainText('Karta zůstává v lekcích (1): „Další lekce“');
+	await expect(page.locator('.toast')).not.toContainText('Karty mimo lekci');
+	const result = await exported(page);
+	expect(result.blocks).toEqual(doc.blocks);
+	expect(result.lessons[1]).toEqual(doc.lessons[1]);
+	expect(result.lessons[0].blocks.map((b: { block_id: string }) => b.block_id)).not.toContain(id);
+	await page.getByRole('button', { name: 'Vrátit zpět', exact: true }).click();
+	expect((await exported(page)).lessons).toEqual(doc.lessons);
+});
+
+for (const orphan of [false, true]) {
+	test(`Smazat kartu deletes a card nothing else points at, and Vrátit zpět brings it back (${orphan ? 'orphan' : 'bound card'})`, async ({
+		page
+	}) => {
+		await load(page);
+		if (orphan) await cardAction(page, REMOVE);
+		await cardAction(page, ERASE);
+		await expect(page.getByRole('dialog')).toHaveCount(0);
+		await expect(page.locator('.toast')).toContainText('Karta smazána');
+		expect((await exported(page)).blocks).toHaveLength(2);
+		await page.getByRole('button', { name: 'Vrátit zpět', exact: true }).click();
+		expect((await exported(page)).blocks).toHaveLength(3);
+	});
+}
+
+test('Smazat kartu asks where the pointers should go when another card needs the card', async ({
+	page
+}) => {
+	await load(page);
+	// The second card: a branch and a prerequisite point at it.
+	await page.locator('.cards .tree-card').nth(1).click();
+	await cardAction(page, ERASE);
+	const dialog = page.getByRole('dialog', { name: /Smazat kartu/ });
+	await expect(dialog).toBeVisible();
+	await expect(dialog).toContainText('tuto kartu obsahuje');
+	// The card to redirect to is chosen in the shared picker, not in a native select.
+	await dialog.getByRole('button', { name: /tuto kartu obsahuje/ }).click();
+	const picker = page.getByRole('dialog', { name: 'Kam odkaz povede' });
+	await expect(picker.getByRole('button', { name: 'Zrušit odkaz' })).toHaveAttribute(
+		'aria-current',
+		'true'
+	);
+	await picker.locator('.choice').nth(1).click();
+	await expect(picker).toBeHidden();
+	await expect(dialog.getByRole('button', { name: /tuto kartu obsahuje/ })).toContainText(
+		'Přesměrovat na kartu'
+	);
+	await dialog.getByRole('button', { name: 'Zpět', exact: true }).click();
+	expect((await exported(page)).blocks).toHaveLength(3);
+	await cardAction(page, ERASE);
+	await dialog.getByRole('button', { name: 'Smazat a opravit odkazy' }).click();
+	expect((await exported(page)).blocks).toHaveLength(2);
+});
+
+test('an undo notice cannot undo a later content edit', async ({ page }) => {
+	await load(page);
+	await cardAction(page, REMOVE);
+	await expect(page.locator('.toast')).toBeVisible();
+	await addStep(page, 'Text');
+	await expect(page.getByRole('button', { name: 'Vrátit zpět', exact: true })).toHaveCount(0);
+	await expect(page.locator('.orphans .tree-card')).toHaveCount(1);
+});
+
+test('the XP chip is the most the steps can earn, a typed xp included', async ({ page }) => {
+	await openEditor(page);
+	const card = page.locator('main .card');
+	// The explanation is on the chip itself, so it does not take a line on every card.
+	const xpChip = card.getByTitle(/8 XP za každou otázku zodpovězenou správně za plný počet bodů/);
+	await expect(xpChip).toHaveText('1 XP');
+	await expect(xpChip).toHaveAttribute('title', /i když je karta ještě rozepsaná/);
+	await addStep(page, 'Otázka', card);
+	await expect(xpChip).toHaveText('9 XP');
+	await addStep(page, 'Text', card);
+	await expect(xpChip).toHaveText('10 XP');
+	// The app never reads a card's own `xp`, so a typed one is not shown as its reward.
+	await load(page);
+	await expect(card.getByText(/vlastní hodnota/)).toHaveCount(0);
+	const before = Number((await xpChip.textContent())!.replace(/\D/g, ''));
+	await addStep(page, 'Text', card);
+	await expect(xpChip).toHaveText(`${before + 1} XP`);
+});
+
+test('a card says how long it takes only once someone has said so', async ({ page }) => {
+	await openEditor(page);
+	const card = page.locator('main .card');
+	const length = card.getByTitle('Očekávaný čas na kartu');
+	await expect(card.getByTitle(/8 XP za každou otázku/)).toBeVisible();
+	await expect(length).toHaveCount(0);
+	await expect(card).not.toContainText('odhadem');
+	await load(page);
+	await expect(length).toHaveText(/\d+ min/);
+});
+
+test('the card keeps Nastavení karty in view and the rest in one menu, deleting last', async ({
+	page
+}) => {
+	await load(page);
+	await expect(page.getByRole('button', { name: 'Nastavení karty', exact: true })).toBeVisible();
+	// Nothing else on the card is a loose button any more.
+	await expect(page.getByRole('button', { name: 'Smazat kartu', exact: true })).toHaveCount(0);
+
+	const menu = await cardMenu(page);
+	await expect(menu.getByRole('menuitem')).toHaveText([
+		'Duplikovat kartu',
+		'Odebrat z lekce',
+		'Posunout nahoru',
+		'Posunout dolů',
+		'Smazat kartu'
+	]);
+	await page.keyboard.press('Escape');
+	await expect(menu).toBeHidden();
+});
+
+test('Nastavení karty is the same quiet gear in every mode, and lists what it holds', async ({
+	page
+}) => {
+	await load(page);
+	const settings = page.getByRole('button', { name: 'Nastavení karty', exact: true });
+	await expect(settings).toHaveText('');
+	// The tooltip is what the teacher's dialog holds, not the metodik's list.
+	await expect(settings).toHaveAttribute('title', /délka, nápověda pro celou kartu/);
+	await expect(settings).not.toHaveAttribute('title', /klasifikace/);
+	await settings.click();
+	const dialog = page.getByRole('dialog', { name: 'Nastavení karty' });
+	await expect(dialog).toContainText('Délka');
+	await page.keyboard.press('Escape');
+
+	// Metodik and Pokročilý add folds to the dialog, not words to the card.
+	for (const mode of ['Metodik', 'Pokročilý']) {
+		await page.getByRole('radio', { name: mode }).click();
+		await expect(settings).toHaveText('');
+	}
+	await expect(settings).toHaveAttribute('title', /co karta procvičuje/);
+	await expect(settings).toHaveAttribute('title', /opakování/);
+});

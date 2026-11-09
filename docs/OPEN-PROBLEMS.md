@@ -1,0 +1,586 @@
+# Open problems
+
+Everything found in feedback round 2 and in the two scripted author sessions after it
+that is **not fixed**. Nothing here is a plan; it is the list of things a teacher can
+still hit, written down so the next round starts from what is known rather than from
+what is remembered.
+
+Fixed items are not repeated here — `docs/FEEDBACK-2.md` is the report they came from
+and `docs/DECISIONS.md` ("Feedback round 2") says what was decided about each.
+
+The **Verified** column is the honest part. Two of five findings from the first scripted
+author and two of six from the second did not survive checking, so a claim nobody has
+reproduced is marked as such rather than quietly promoted to a fact.
+
+## How this file is organised
+
+Three sections hold the *live* list, so that a reader can tell a defect from a decision:
+
+- **Defects** — something is wrong and a teacher can hit it. These want fixing.
+- **Unconfirmed** — not reproduced, or reproduced only from the code. They stay until
+  someone sees them, or until the round that would have shown them is long past.
+- **By design, recorded because it is surprising** — the behaviour is intended; the
+  entry exists so nobody "fixes" it back. These are decisions wearing a defect's
+  clothes, which is why they are not under *Defects*.
+
+**Fixes that live in the app repository** (letters A–G) is a fourth section, and it is
+not live either: the player is a repository this project cannot push to, so some fixes
+live there. A and B are done; C–G are recorded for the day they matter.
+
+**Closed** at the end of the file is not live either. It keeps the entries whose headings
+are cited from `docs/DECISIONS.md`, `docs/spec/COURSE-EDITOR-SPEC.md` or a source comment,
+so that every existing citation still resolves.
+
+**Entry numbers are a citation key and are stable.** `docs/spec/COURSE-EDITOR-SPEC.md`,
+`src/lib/domain/validate.ts`, `src/lib/editor/RailPeek.svelte` and earlier rounds of
+`docs/DECISIONS.md` cite entries by number or letter, so an entry is never renumbered to
+close a gap. Numbers are unique but not contiguous (there is no 36), and the round-9 audit
+entries keep their `Round 9 audit #N` names rather than being folded into the sequence.
+Where an entry is cited elsewhere, the entry says so.
+
+---
+
+## Fixes that live in the app repository
+
+The player is a repository this project cannot push to, so some fixes had to be written
+there, or recorded for the day they matter. A, B, C and C2 are done and now sit under
+*Closed*; D–G are recorded here and want nothing until the situation they describe
+changes.
+
+### D. API: a status change bumps the version without a new file — API-side
+**Verified: yes**, read off the code. `Course::boot` (`app/Models/Course.php:91-95`)
+increments `version` on any update that does not set it, so `PUT /courses/{id}` with
+only `{status}` — which is how the admin publishes — raises the stored version while
+the stored file stays `v{old}.json`. The app compares versions, sees an update, and
+locks the course's lessons behind the update banner for a file that did not change;
+the editor's next upload then has to beat a number nobody authored. Matters for the
+version control the editor is getting: publishing from it must always upload the whole
+document with an explicit version, never flip a status alone.
+
+### E. API: the upload writes to storage before checking ownership — API-side
+**Verified: yes**, read off the code. `CourseController::upload` writes the file to R2
+(`:190-199`) before the teacher-owns-this-course check (`:201-205`). A refused upload
+still leaves an object at `courses/{id}/v{n}.json`. Not reachable from the editor
+today (publishing is not wired), recorded for when it is.
+
+### F. The app's library hides `data['private']`, an undocumented key — app-side
+**Verified: yes.** `knihovna_page.dart:466-470` filters out a course whose JSON has
+`private: true`, a key that is in neither spec. Harmless while nothing writes it; the
+editor will not, and uses `status: private` for "PIN only".
+
+### G. The player is still 3 MB to a teacher's first preview — app-side
+**Verified: measured** (Round 19), on the Docker image's player: the preview-only build
+(`player/preview_main.dart`) with brotli. What is left is the app's to cut:
+- `main.dart.js` is 9.2 MB (1.25 MB brotli): the Flutter framework plus every package
+  the preview's widgets import (Markdown, maths, HTML, video). Deferred imports in the
+  app (`import … deferred as`) would load the heavy renderers when a card needs them.
+- The build ships 22 `.ttf` and one `.otf` in `assets/`, and `google_fonts` fetches from
+  Google at run time (#17). Measured in Round 20: all 15 KaTeX fonts (348 KB brotli)
+  and Roboto load at start, for every card, maths or not. Registering KaTeX's fonts
+  lazily is the app's to do.
+- `flutter build web --wasm` (the smaller, faster skwasm renderer) fails:
+  `flutter_secure_storage_web` 1.2.1 uses `dart:html`, which wasm builds do not support.
+  Seen on 2026-10-01 at this `PLAYER_REF`, not re-run since. It needs a dependency
+  upgrade in the app.
+
+---
+
+## Defects
+
+Entries where something is wrong and a teacher can hit it. These want fixing. The note at
+the top of this file applies: numbers are a citation key and are never renumbered.
+
+### 56. Publishing a Cvičení or Test course would be refused — API-side
+**Verified: by reading the code** (Round 23). `POST /api/courses/upload`, the editor's
+publish route (`api/client.ts`), validates `export_type` as `in:course_v2` only
+(`UploadCourseRequest`), while the admin's `store` accepts all three. Publishing is not
+wired to a button yet (DECISIONS "Still open" 2); when it is, an `exercise_v2` or
+`quiz_v2` course gets a 422. The course-type titles say "Nahrání kurzu zatím přijme
+jen typ Kurz." Note also that `exercise_v2` has no effect in the app (Round 23).
+
+### 57. A step's practice flag lists a card in the course's exercises but seeds no review card — app-side
+**Verified: by reading the code** (Round 23). `Course.getDefaultPracticeBlocks` honours a
+step's `default_practice` (`course_model.dart`), so the card shows among the course's
+exercises. Both paths that create FSRS practice cards (`createCardsFromLesson`, also used
+by `seedCardsFromCourse`) read only `ContentBlock.defaultPractice`, the block's or the
+binding's flag. The step's switch says so; the fix is app-side.
+
+### 17. The player still talks to other origins while it runs — app-side
+**Verified: yes.** Google Fonts (the app's `google_fonts`) and `accounts.google.com`
+(its Google Sign-In client). They do not block the boot, since the build carries
+CanvasKit and the Microsoft sign-in script is dropped from the preview page (DECISIONS
+Round 5), but a slow or unreachable host still delays the fonts, and a font that
+arrives late re-wraps the text. The fix is app-side: bundle the fonts, and don't
+start sign-in on `/preview`.
+
+### 18. Náhled is a hand-drawn copy of the app's card layout
+**Verified: yes.** `lib/preview/preview_expanded_block.dart` in the fork draws every card
+as one box per step, each with its own button row. The app draws a `question` or
+`exercise` card as one bubble with dividers and the text merged into the question after
+it (`BlockStepEngine._buildExerciseCard`). So Náhled and Vyzkoušet show those cards
+differently, and every per-type rule has to be copied by hand (AGENTS.md rule 2). The
+fix is to render Náhled through the engine itself, as a finished card whose taps go to
+click-to-edit, with a Flutter test that the two lay out every card type alike.
+
+### 19. The app grades a block as one item — app-side, and why questions are split
+**Verified: yes, by reading the upstream code.** Best score over the block's questions
+(`_bestScoreKoef`), the last mark given, one Kvíz answer (`scoreKoef >= 1.0`), one ELO
+update and one practice card per block. Also: XP counts every step, including ones a
+branch skipped; Kvíz takes only `exercise` blocks; the engine's cards are never graded
+for spaced repetition (`_recordFsrsReview` is called only for atomic questions and
+self-rated display cards). The editor now writes one block per question (DECISIONS Round
+7), which makes the first four right per question. The rest need the app.
+
+### 20. A jump into a later block leaves the blocks it skipped in the lesson, unfinished
+**Verified: in the fork's Vyzkoušet, which draws it as the app does.** A jump inside a
+split `question` card is now a jump between its blocks, and the blocks jumped over stay
+in the pupil's list, drawn unfinished on their first step. Imported cards that jump
+inside themselves are kept whole for this reason; a teacher who adds such a jump to a
+card now gets this behaviour. App-side: the lesson list would have to hide a block a
+branch skipped.
+
+### 21. "Ukončit blok" on a card's first question ends only that question
+**Verified: by construction (Round 7).** In a card split into blocks, `END` completes
+the question's own block, and the pupil goes on to the card's next question, so for a
+teacher it does what "Pokračovat dál" does. The option is not relabelled. An imported
+card with such an `END` is kept whole.
+
+### 26. Hover-hidden actions on a touch screen are unverified
+**Not reproduced.** A step's Duplikovat and Smazat, its drag grip, and the + between steps
+are drawn faint or invisible until hover or focus, and always drawn under
+`@media (hover: none)`. Playwright's desktop Chrome has a hover, so no test runs that
+query, and it has not been tried on a tablet or in device emulation with touch. If a
+touch device reports `hover: hover` (some do, with a paired mouse), the actions show only
+after a first tap on the step, which focuses it.
+
+The rail's tile and the tree's row follow the same pattern, but they are the first places
+where the pattern has a stated fallback: on `@media (hover: none)` tapping the selected
+tile toggles its panel, and the tile's panel is also what a right-click, Shift+F10 and the
+ContextMenu key pin. The tree's rows have no touch path of their own yet. Still unverified
+on a device that reports `hover: hover` without a mouse.
+
+### 34. Metodik noise
+**Not reproduced by a teacher, seen in the interface.** The step part is addressed
+(Round 10): the per-step practice switch is offered only when the card is not already in
+practice (`stepPracticeOffered`), and sits in the folded „Další nastavení kroku“. What is
+left is unread fields drawn as empty rather than as "not asked yet", now #41, and the
+rule about which fields a card of a given type actually earns, which is the same one #25
+is waiting on.
+
+### 38. A question with several picks still carries "Kam dál" and grades nobody can see or clear
+**Reproduced in unit tests.** With "Víc správných možností" on, the table hides the
+columns the app ignores (DECISIONS Round 9), so an answer's old branch and grade stay in
+the file with no field to clear them, except by switching the option off and on again.
+`W_OPTION_OUTCOMES_IGNORED` says so at export review. Also app-side: the multi-select
+branch of `_confirmAnswer` skips an option's `score_koef` too (`block_step_engine.dart:597-601`),
+which the advanced "Podíl bodů" field still offers. Not changed here.
+
+### 48. Teachers cannot upload an image; the visual editor takes web addresses only
+**Verified by reading the API.** The only upload is `POST /api/admin/assets/upload`
+(S3, public URL), and it is admin-only. So an image in a text, like an image step, is a
+public `https://` address; a pasted or dropped image *file* gets one line saying how to
+copy an image's address instead. Opening that endpoint to teachers is API-side.
+
+### 49. Links in a text cannot be tapped in the app
+**Reproduced by reading the app.** `MarkdownLatexWidget` sets no `onTapLink`, so a link
+is styled but dead. The visual editor keeps the links a text already has and offers no
+link button; pasted links stay links. App-side.
+
+### 50. The app turns every `\n` in a text step into a line break, including inside a formula
+**Reproduced by reading the app** (`block_model.dart` `displayText`:
+`replaceAll(r'\n', '\n')`). It is there for backends that double-escaped newlines, and it
+also hits LaTeX: `$a \neq b$`, `\nu`, `\nabla`, `\newline` lose their command to a line
+break in a text step (not in hints, answers or solutions, which do not go through it).
+The editor writes what the teacher typed; the fix is app-side. Until then, `\ne` has the
+same problem and `\not=` does not.
+
+### 51. Formulas in the editor are drawn by KaTeX, in the app by flutter_math
+**Not a reproduced defect; a known difference.** Both read the same LaTeX, and for school
+mathematics they agree. A command one supports and the other does not would draw in the
+field and fall back to orange source in the app (or the reverse). Náhled is the reference:
+it is the app.
+The formula row's own field is MathLive, a third renderer; what it writes is passed
+through `domain/app-latex.ts` so the app can draw it (DECISIONS round 25).
+
+### 52. The app cannot draw `\ce{…}` (mhchem) — chemistry formulas fall back to source there
+**Reproduced by reading flutter_math_fork 0.7.4** (`lib/src/parser/tex`): it has the mhchem
+arrow *glyphs* (svg_geometry.dart mentions them) but no `\ce` function or macro, so
+`\ce{2 H2 + O2 -> 2 H2O}` is an unknown command in the app and the step shows the raw source.
+The editor draws `\ce` fine (KaTeX + its mhchem contrib, loaded in `ui/rich/math.ts`), and
+MathLive parses it, so the keyboard stores the canonical `\ce{…}` (math-input brief §4.3
+tab 8; the key definitions carry the note). App-side: port mhchem or expand `\ce` on the
+editor side. Until then the chemistry tab is editor-only in effect.
+
+### 53. The app has no ‰ glyph — per mille falls back to source there
+**Reproduced by reading flutter_math_fork 0.7.4**: no `\textperthousand`/`\permille` and no
+U+2030 in its symbol tables. KaTeX in the editor renders `5\,‰`; the app cannot. The
+keypad keeps the ‰ key (its data notes the gap); app-side fix is one symbol entry.
+
+---
+
+## Unconfirmed
+
+Entries not reproduced, or reproduced only from the code. They stay until someone sees
+them, or until enough rounds pass that the behaviour would have surfaced.
+
+### 7. A possible transition artifact in "Vyzkoušet" — likely fixed (Round 5)
+**Verified: no.** One scripted author flagged it and was explicit about not being sure
+what they saw. Round 5 found three real transition bugs, and any of them would look
+like this:
+- a finished card was re-created as merely "completed", losing its answers and
+  opening every step;
+- a card a branch jumped over was drawn as finished;
+- the editor opened every step of the next card.
+
+All three are fixed and tested. Close this if nobody reproduces it again.
+
+### 9. The markers in Náhled print Markdown and LaTeX as typed
+**Verified: yes**, seen in the browser. The hint, help and branch markers are plain
+`Text`, so "Pomoc: Ve zlomku $\frac{a}{b}$ říká **b**" shows its syntax. They are
+preview-only notes, so it misleads nobody about what the student sees, but it reads
+badly. Fix is in the fork (render them with `MarkdownLatexWidget`), not done.
+
+---
+
+## By design, recorded because it is surprising
+
+The entries whose behaviour is intended, so that none of them is read as a defect
+waiting to be fixed. Each is written up **once**, here. The numbers are the citation
+key, not a reading order — 4 and 5 were the first entries ever written and 11 was added
+last, which is why the sequence is neither ascending nor contiguous.
+
+### 12. Server versions are reachable only from the browser that made them
+**By design until sign-in.** The owner is a random key in this browser's
+`localStorage`; the server stores its hash. Clear site data, or open another browser,
+and that server history is out of reach — it is not deleted, nobody can find it. The
+dialog and the "Kde je kurz uložený" note say so. Fix: sign-in, then
+`lib/server/versions/owner.ts` resolves the session instead of the key. The question
+side of this is `DECISIONS.md` "Still open" 3.
+
+### 13. Publishing marks a version and downloads it; it does not upload
+**By design until sign-in.** `POST /api/courses/upload` needs a signed-in teacher.
+Until then "Zveřejnit" records which version is out, for whom, and downloads that file
+for the administration's upload. The API's own quirks (D, E) matter the day it is
+wired. The blocking question is `DECISIONS.md` "Still open" 2.
+
+### 5. A no-op import → export rewrites key order in real-world files
+**Verified: yes**, and deliberate: output key order is canonical so that a publish diff
+is readable (`docs/DECISIONS.md`, M1). Values round-trip deep-equal — the scripted
+author confirmed that separately. The cost is that re-exporting an existing file
+produces a few hundred lines of diff that are all noise, which makes "what did I
+actually change" hard to answer for a course that came from somewhere else.
+
+### 16. "Přejít" can switch the editing mode
+**By design, recorded because it is surprising.** A review row whose fix is in a higher
+mode switches to that mode on the jump, and the mode stays switched. The alternative —
+landing on a card whose field is not drawn — is what this replaced. *Cited from
+`DECISIONS.md` Round 8, which applies the same rule to 24.*
+
+### 23. Editing a card overwrites settings its blocks disagree on
+**Verified: by construction.** A card's settings are written to each of its blocks. If
+an advanced author gave two blocks of one card different settings, the teacher's view
+shows the first block's, and the next edit to the card writes them to all its blocks.
+Nothing warns about the disagreement.
+
+### 24. A jump onto a hidden feedback field switches feedback back on
+**By design, recorded because it is surprising.** The twin of 16. While Zpětná vazba is
+off, "Přejít" (from the panel or the export review) and a click on the "?" in Náhled that
+lands on a hint, help, solution or answer feedback turns it back on, and it stays on. The
+alternative, landing on a card whose field is not drawn, is what the switch replaced.
+**Reproduced:** yes, in `e2e/feedback-toggle.spec.ts`.
+
+### 27. Removing the card's crumb removed the way to a lesson's settings from the card
+**By design, recorded because it is a change.** The crumb's lesson name opened the lesson's
+settings. A card in a lesson has no crumb now (DECISIONS Round 8); the lesson's settings
+are on its row in the tree, and since Round 9 also in the panel beside a lesson circle in
+the folded rail. The lesson's own deletion and duplication are in that dialog, so nothing
+a teacher needs is reachable only from a hover.
+
+### 43. What the Round 11 CRUD re-audit left
+**Found by a scripted audit of every settings and editor-column flow, not fixed.**
+Reproduced in the browser unless said otherwise.
+- A skill's level cannot be changed in place (remove it and add it again), and neither
+  skills nor answers can be reordered.
+- Předpoklady: choosing a skill silently clears the card select, and the threshold stays
+  disabled until one of the two is chosen, with nothing saying why. The card picker lists
+  cards with the same title twice („Kolik je?“), with nothing to tell them apart.
+- „Barva karty“ and „Pozadí karty“ (V této lekci) are free text with no picker, and
+  „Zařadit do cvičení“ appears both in Základní and in V této lekci (the second is the
+  legacy binding flag).
+- Zpět is enabled right after an import and goes back to the empty „Nový kurz“.
+- „Kdo kurz uvidí: Veřejný“ in course settings reads as text rather than a way to the
+  version dialog.
+- Playwright sees a `pageerror` with an empty message on every page load; the editor works.
+  Not traced.
+- Pokročilý shows block and step ids in „Kam dál“ and the step headers, and GPF codes on
+  skill rows. Pokročilý is meant to show them; listed so the choice is a decision, not an
+  accident.
+
+### 45. What the Round 12 teacher test found and left
+**Found by an agent doing six teacher tasks by reading only the screen. Mostly fixed in
+Round 13 (`DECISIONS.md` → Round 13); what is left:**
+- Pojmy typed fresh keep the case they were typed in; only a term the course already uses
+  takes the course's spelling.
+- The step's „Další nastavení kroku“ has no line naming what a higher mode adds there.
+- From the Round 13 teacher test (all eight tasks done, these slowed it down):
+  Pokročilý also changes the XP totals and names steps „s1“ instead of „Krok 1“, which
+  the one-time note does not mention; the import banner says „V editoru vypadají stejně“
+  while Pokročilý shows them split. The cut-off warning says „Krok 3“, not the step's
+  name. „Kam dál“ groups read as jargon („Průběh“, „Krok v tomto bloku“, „Ukončit blok“).
+  Answer feedback shows raw Markdown (`**nahoře**`). Search knows a few teacher words per
+  section, not a thesaurus. Settings in a higher mode still need the switch: that is
+  the modes' design, now signposted.
+- Fixed in Round 13, kept as a record: settings hidden by the mode (a line naming what
+  the next mode adds, with „Přepnout“, and search in every mode); split cards in Pokročilý
+  (joined in the tree, explained once); „↳ Krok 3“ is the way to an answer's „Kam dál“,
+  and the picker opens below it; a step cut off by a change is said under the answer;
+  a new skill row is marked; the undo notice sits in the dialog's footer; Pojmy suggest
+  the course's terms; „Kam dál“ keeps letters typed while it opens; „výchozí sada“ is a
+  grey label with its meaning; the course dialog has „Hotovo“.
+
+### 11. Folding is remembered for the session only
+**By design for now.** `StepView` lives as long as the page. A reload opens every step
+again. Worth persisting with the draft if authors of long cards ask for it. Appears last
+because it was added after 39 and the numbers are a citation key, not a reading order.
+
+---
+
+## Closed
+
+Headings kept so that a citation from `docs/DECISIONS.md`,
+`docs/spec/COURSE-EDITOR-SPEC.md`, a source comment or an earlier round still resolves.
+**Nothing here is open**, and the entries no longer sit in the live list above. The round
+that closed it is named, and the reasoning is in that round's section of
+`docs/DECISIONS.md`.
+
+### 33. Labels the editor uses in two senses
+Fixed (Round 24): „karta“ everywhere a teacher reads, „Vrátit“ for undo and „Zpět“ only for going back, „Opakování“ for the practice flag.
+
+### 4. "Duplikovat lekci" shares its cards rather than copying them
+Copies the cards now; one button, no question (Round 24).
+
+### 14. The FSRS fields write keys the app does not read
+Decided (Round 24): the fields stay, they are in the V2 schema; the Opakování note says which ones the app reads.
+
+### 22. The version button says "upraveno" right after importing a multi-question course
+Already fixed; `e2e/import-version.spec.ts` guards it (Round 24).
+
+### 25. In quiz_v2 courses the app shows no solution or feedback, but the editor still asks for them
+Fixed (Round 24): `domain/course-feedback.ts`; the editor no longer asks for what a Test without evaluation never shows.
+
+### 28. A menu opened while the column is still scrolling closes at once
+Fixed (Round 24): the menu follows its button while the column scrolls.
+
+### 30. Ctrl+Shift+B leaves focus on the page when it folds the preview
+Fixed (Round 24).
+
+### 31. Focus does not follow what was added or deleted
+Fixed (Round 24): `ui/focus-after.ts`, one convention for every add and delete.
+
+### 32. The validation panel
+Fixed (Round 24): Escape, remembered dismissal, „zveřejnit“.
+
+### 35. Changing a card's type
+Rejected (Round 24): the card's menu keeps its five actions.
+
+### 37. Ctrl+Z in a plain input undoes the course, not the text
+Fixed (Round 24).
+
+### 41. Unread fields no longer say so on screen
+Addressed (Round 24): one line under Opakování, derived from `unread`, says which values the app uses.
+
+### 44. Opakování explains too little, and waits for the newer app
+Fixed (Round 24): plain hints for every field.
+
+### 46. The player takes focus from the field being typed in when it boots
+Fixed (Round 24).
+
+### 52. Faint text in the top bar and elsewhere fails WCAG AA colour contrast
+Fixed (Round 24): text tokens meet AA; `e2e/accessibility.spec.ts` gates `wcag2aa`.
+
+### 53. A folded step is a fixed 51px tall
+Fixed (Round 24): measured header height.
+
+### 54. The editor still describes the app before its 2026-10-15 sync
+Fixed (Round 24): `domain/hint-reach.ts`, per exported block.
+
+### 55. A plain line that starts like a list, quote, heading or number cannot be shown as typed — app-side
+Editor side fixed (Round 24): the editor shows the text as typed; Náhled keeps the app's reading, which the app is expected to fix.
+
+### 58. The image row may stay open after a click back into the text
+Fixed (Round 24).
+
+### 59. Two lists of image extensions decide how a picture is fetched
+Fixed (Round 24): one list in `scripts/image-extensions.mjs`. An address with no extension is still fetched directly.
+
+### 60. A card named from its text loses underscores and stars inside words
+Fixed (Round 24): the name comes from the parsed document.
+
+### 15. A card's own XP is shown as its reward, and the app ignores it — fixed (Round 23)
+The card chip and the lesson and course totals show the most the steps can earn, the
+figure the app's lesson card promises (`_calculateBlockMaxXp`), whatever `xp` says. The
+modes no longer disagree.
+
+### 47. A text with formatting but no `*`, `__`, `##`, ``` ``` ```, `$` or `![` is shown raw by the app — mostly fixed upstream (Round 23)
+The 2026-10-15 app also reads a list, number, quote, table, `#` heading or link as
+Markdown, and the editor now asks the same rule (`content_format.dart`). A strikethrough
+alone is still shown raw. The reverse limit is #55.
+
+### C. The app's question mark was always the first step's — closed (fixed upstream, Round 21)
+The upstream engine gated the "?" on `ContentBlock.hasHint`, which read the step at
+`currentStepIndex`, and nothing moved that off 0, so every step offered the first step's
+hint. The fork fixed it (`f90a384`). The 2026-10-15 upstream fixed it its own way
+(BR-JHDNB3): `hintForStep(stepId)`, and `onHintRequested` carries the step. Every step card
+of a `display` block has its own "?"; a question or exercise card has one, for the step
+the engine is on. The fork's fix was dropped when the preview moved onto that upstream
+(fork `a8a9528`, DECISIONS Round 21), and Náhled's markers follow the new rule.
+
+### C2. A question card's later questions looked answerable and were not — closed (upstream chose otherwise, Round 21)
+Upstream drew every step of a question or exercise card at once, and only the current
+question took input. The fork revealed one question at a time. The 2026-10-15 upstream
+went the other way (BR-E4H835): every question is live at once, the check waits until
+all are filled, and a card with no open question is graded in one tap, as the share
+answered correctly. The fork's version was dropped so that Vyzkoušet is the pupil's app
+again (DECISIONS Round 21). In such a card a per-question `go_to` is ignored — recorded
+for the editor's warnings in Round 21's follow-ups.
+
+### 39. The design brief agents are told to follow is not on `main` — closed (brief merged)
+**Verified by reading the repo.** The standing instructions every agent on this project
+gets — the workspace `AGENTS.md`, which sits outside this repository, next to the
+checkouts — tell them: *"For anything a teacher sees, follow `docs/DESIGN.md`"* (in this
+repo). That file does not exist on `main`. It was written by the 2026-09-29 design review
+and pushed as branch `claude/design-brief`, which is open for review and unmerged. So
+the standing instructions point at a document the repository does not contain, and an
+agent that checks will find nothing; one that does not check will invent a design
+authority from the current UI — which is exactly what the brief was written to stop.
+
+This is the owner's call, not a fix to make here. Either **merge that branch** (the brief then
+becomes real authority and this entry goes away), or **rewrite the instruction** to say
+the brief is a *proposal pending approval* and the current UI is not yet the target.
+Until one of those happens the reference in the workspace instructions is marked as
+pending rather than approved, so nobody mistakes a proposal for a decision.
+
+The same branch also rewrites `docs/DECISIONS.md` and `docs/OPEN-PROBLEMS.md` down to
+their post-review state, so merging it is not a docs-only change: it is a decision about
+which of those files is canonical. That is why it was not merged as part of the
+2026-09-30 workspace tidy.
+
+**Closed in Round 15.** The brief was merged; `docs/DESIGN.md` is on `main` and is
+the authority `AGENTS.md` says it is.
+
+### 1. An empty lesson is invisible to validation — fixed (Round 4)
+`W_EMPTY_LESSON` reports it in the review. The tree still says "5 min" for it, on
+purpose: that is the number the app shows a student (`course_model.dart` floors the
+estimate at five), and the editor's totals mirror the app's arithmetic. *Cited from
+`src/lib/domain/validate.ts`.*
+
+### 2. Dragging a card to reorder it only grabs on the text — fixed (Round 8)
+**Reproduced: yes** (`e2e/tree.spec.ts`, which fails without the fix); the heading stays
+because `DECISIONS.md` Round 8 cites it. The cause was as reported: `svelte-dnd-action`
+refuses to start a drag when the press lands on an element that has a `value` and is not
+the draggable itself, and every `<button>` has one. The card's row was a `<button>` inside
+the `<li>` the library drags, so a press on the button's padding did nothing and only a
+press on the text inside it (a `<span>`) grabbed.
+
+The cards in the open lesson are now `<div role="button" tabindex="0">`; Enter and Space
+select them, and the library's own keyboard drag is off for them (`zoneItemTabIndex: -1`,
+and the key is claimed before the `<li>` sees it). The list of cards outside any lesson is
+not a drag zone and keeps real buttons.
+
+### 3. `block.status` is authored and read by nothing — no longer offered (Round 4)
+New cards carry no status, the chip is gone, and no mode offers the field. Imported
+values survive. Publishing moves to the course (version control, in progress). *Also
+under `DECISIONS.md` "Still open" → Closed from this list.*
+
+### 6. The downloaded filename does not follow a course rename — fixed (Round 4)
+The file is named from the course name. Every new course also gets its own id now; it
+used to be `NOVY_KURZ` for all of them.
+
+### 8. The "draft" status has no rollup — moot, card status is gone (Round 4)
+
+### 10. The preview's status chip says "Náhled" in Vyzkoušet too — fixed (Round 9)
+A running player has no chip now; the column's `data-player` is what tests read. *Cited
+from `DECISIONS.md` Round 9.*
+
+### 29. The gear on a rail tile is a small target — fixed (Round 9)
+The folded panel's tile has no gear at all now: it is a 36×36 icon, and its four actions
+(Nastavení, Duplikovat, Odebrat z lekce, Smazat) are 32px circles in a panel that opens
+beside it, in the top layer so the sidebar's overflow cannot clip it. A lesson circle's
+gear went the same way into its own, lighter panel. The 14px target is gone. *Cited from
+`DECISIONS.md` Round 9.*
+
+### Round 9 audit #8. A deleted lesson said nothing and left the editor in a lesson that was gone — fixed
+`deleteLesson` returned no `ref`, so after deleting the lesson the editor was standing in,
+the column kept showing the lesson that no longer existed. The command now returns the
+neighbouring lesson (the next, else the previous), `editor/lesson-actions.ts` moves the
+selection only when it was inside the deleted one, and the shared notice says "Lekce
+smazána. Její karty jsou v Kartách mimo lekce." with "Vrátit zpět". The lesson's cards are
+left in the course by design (`deleteLesson` never deleted blocks); the message now says so
+instead of leaving the teacher to find out.
+
+### Round 9 audit #10. A chip that computes its own warning — removed
+The tree's open lesson row and Nastavení lekce drew "Zpětná vazba jen u X % chybných
+odpovědí" under the "Zpětná vazba X %" chip. It broke two rules at once: no chip states a
+verdict of its own, and a warning waits while the teacher is still writing. It also stayed
+on screen with Zpětná vazba switched off. The chip that states the share stays, and every
+question is covered by `W_NO_WRONG_OPTION_FEEDBACK`; the second line, its `.nudge` and
+`.warn` rules and the `lessonDidactics` call behind them are gone.
+
+### A. Images — moved into the editor (done)
+The player routes every image through the Laravel proxy, which 502s for hosts that
+redirect or that refuse the API server (`picsum.photos`, `upload.wikimedia.org`;
+`placehold.co` works, which is why the failure looks random). The editor serves the
+player's bytes, so the fix lives here instead: a same-origin `/preview-image` endpoint
+that fetches the image server-side — where CORS does not apply — and falls back to the
+Laravel proxy, plus a shim injected into the player's `index.html` that redirects the
+player's own proxy requests to it. **The editor no longer needs a patched player for
+images.**
+
+### B. Click-to-edit hit target — shipped in the fork (done)
+The card-level opaque `PreviewTarget` is in the fork since `22b37cb`, so a click on a
+step's padding in Náhled lands on the step. It is fork-only: `edu-ai-00` has no
+`lib/preview/` at all, so nothing here depends on it being accepted upstream.
+
+### 40. Production `nginx.conf` is exercised by no test, and it has already served a blank preview once — closed (round 16)
+**Verified by reading the repo and the 2026-09-30 fix** (`1bcff8d`). In the image, nginx
+serves `/player/` and the editor on one origin; `vite preview` serves `/player/` a
+different way (`vite-plugin-player.ts`), which is what the e2e suite runs against. So the
+config that actually ships is reached by nothing in CI and nothing in `e2e/`.
+
+That is not theoretical. On 2026-09-30 the `/player/` asset `location` matched its
+requests but had **no `alias`**, so nginx served those paths from its *default* root and
+every `.png` / `.ico` / `.woff` / `.wasm` under `/player/` was a 404 — CanvasKit above
+all. The page loaded, the wasm did not, and the preview stayed blank. `1bcff8d` fixed it
+by capturing the asset path by name (`location ~* ^/player/(?<asset>…)`) and aliasing it
+into `/usr/share/nginx/player/$asset`. The player's build really does ship
+`canvaskit/canvaskit.wasm`, `canvaskit/skwasm.wasm` and `sqlite3.wasm`, so every one of
+them was in the failing set.
+
+The failure class — *page loads, an asset 404s, the preview is blank* — is invisible to
+`npm run check`, to `npm test`, and to the `editor` and `player` Playwright projects
+alike. It was found by a person looking at an empty preview.
+
+Two things follow, and the second is the one that bites:
+
+- The `/player/` asset block now carries a comment saying why the `alias` and the named
+  capture are both needed, because the obvious "simplification" back to
+  `alias …/player/;` reintroduces a 301 whose fallback still hands Flutter the wrong
+  bytes — a failure that reads as a working request.
+- **Nothing would catch it if it happened again.** A guard is a Docker smoke test: build
+  the image, run it, and assert a known player asset answers `200` with
+  `content-type: application/wasm`, plus a representative `.woff2` and `.ico`. That test
+  fails on the pre-`1bcff8d` config, which is the point of it. It needs the image build
+  (which clones the player at `PLAYER_REF` and runs a Flutter build inside the image), so
+  it is slow and belongs in CI rather than in the local loop. Not written yet.
+
+Not related, but checked while looking: `docker-entrypoint.sh` expands the template with
+`envsubst '$PORT $API_URL'` — an explicit allowlist — so the fix's `$asset` capture and
+nginx's own `$uri` survive expansion. That part is fine.
+
+**Closed in round 16.** CI's `run-docker` job builds the image, runs it and checks it
+with `curl`: besides the page itself, `/player/` must be the Flutter build with the image
+shim, and `/player/canvaskit/canvaskit.wasm` must answer 200 as `application/wasm`. Under
+the pre-`1bcff8d` config it came from nginx's default root and 404'd, so the job should
+fail there; that is read from the config, not run against the old image. It checks that
+nginx serves the player, not that the preview draws; that is still the `player`
+Playwright project, run locally.

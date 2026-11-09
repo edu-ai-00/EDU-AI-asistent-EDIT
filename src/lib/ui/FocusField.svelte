@@ -1,0 +1,314 @@
+<script lang="ts">
+	/**
+	 * A stable native field: its full visible rectangle is always editable. Values
+	 * reach the document on input so recovery includes an unfinished edit. The store
+	 * groups typing until blur/Enter; Escape reverts that editing session. No DOM
+	 * swap, negative margins, or focus effect can swallow the author's first click.
+	 */
+	interface Props {
+		value: string | undefined;
+		label: string;
+		placeholder?: string;
+		/**
+		 * What the placeholder is. A `cue` ("Napiš odpověď…") is an invitation and
+		 * is set in italic. A `stand-in` is the value the field takes when it is left
+		 * empty, like a card's derived name: upright, so it does not read as a
+		 * sentence the teacher forgot to finish, and quieter than real content.
+		 */
+		placeholderKind?: 'cue' | 'stand-in';
+		multiline?: boolean;
+		/** Shown instead of the value when it is empty — the author's cue to fill it. */
+		emptyText?: string;
+		monospace?: boolean;
+		/**
+		 * `compact` keeps the writing line and drops the fill. For headings: a 6 %
+		 * wash under 20px heavy type stops being a hint and starts being a form.
+		 */
+		density?: 'normal' | 'compact';
+		disabled?: boolean;
+		invalid?: boolean;
+		onchange: (value: string | undefined) => void;
+		/**
+		 * Fires when an editing session ends (blur, Enter, Escape, or the ctrl+z/y
+		 * shortcut committing first) — not on every keystroke like `onchange`. For a
+		 * caller that only cares "the author is done for now, not just mid-word", such
+		 * as settling a debounced preview immediately instead of waiting out its pause.
+		 */
+		onblur?: () => void;
+		ref?: Ref;
+		/** Id of the line that describes this field, drawn by the caller. */
+		describedby?: string;
+	}
+
+	let {
+		value,
+		label,
+		placeholder = '',
+		placeholderKind = 'cue',
+		multiline = false,
+		emptyText,
+		monospace = false,
+		density = 'normal',
+		disabled = false,
+		invalid = false,
+		onchange,
+		onblur,
+		ref,
+		describedby
+	}: Props = $props();
+
+	import { tick, untrack } from 'svelte';
+	import { useStore } from './context';
+	import type { Ref } from '$lib/domain/ref';
+
+	const store = useStore();
+	let draft = $state('');
+	let baseline = '';
+	let lastEmitted: string | undefined;
+	let editing = false;
+	let element = $state<HTMLInputElement | HTMLTextAreaElement | null>(null);
+
+	// A multiline field grows with its wrapped text, from three rows up to fourteen.
+	// Browsers with `field-sizing: content` do it in CSS; the rest are measured here.
+	const sizesItself = typeof CSS !== 'undefined' && CSS.supports('field-sizing', 'content');
+	$effect(() => {
+		draft;
+		const area = element;
+		if (!multiline || sizesItself || !(area instanceof HTMLTextAreaElement)) return;
+		area.style.height = 'auto';
+		const line = parseFloat(getComputedStyle(area).lineHeight) || 20;
+		const pad = area.offsetHeight - area.clientHeight + 12;
+		area.style.height = `${Math.min(Math.max(area.scrollHeight + 2, 3 * line + pad), 14 * line + pad)}px`;
+	});
+
+	let mounted = false;
+	// External undo/import/selection changes replace the value without echoing an edit.
+	$effect(() => {
+		const next = value;
+		untrack(() => {
+			// Text typed between SSR paint and hydration landed in the input with no
+			// handler attached yet. Adopt it once instead of overwriting it — dropping
+			// it would silently lose the author's first sentences on every reload.
+			if (!mounted) {
+				mounted = true;
+				const dom = element?.value ?? '';
+				if (!disabled && dom !== '' && dom !== (next ?? '')) {
+					draft = dom;
+					lastEmitted = dom.trim() === '' ? undefined : dom;
+					onchange(lastEmitted);
+					// A field already left before hydration will never blur: its session ends
+					// here, and the text goes back to what the document holds.
+					// No `beginEdit` was made for this text, so there is no `endEdit` to owe;
+					// `onblur` only tells the caller its field is no longer being typed in.
+					if (document.activeElement !== element) {
+						onblur?.();
+						void tick().then(() => {
+							if (editing || lastEmitted === value) return;
+							draft = value ?? '';
+							baseline = draft;
+							lastEmitted = value;
+						});
+					}
+					return;
+				}
+			}
+			if (next !== lastEmitted) {
+				draft = next ?? '';
+				baseline = draft;
+				lastEmitted = next;
+				editing = false;
+			}
+		});
+	});
+
+	function begin() {
+		if (disabled || editing) return;
+		baseline = value ?? '';
+		editing = true;
+		store.beginEdit();
+	}
+
+	function input(event: Event) {
+		begin();
+		draft = (event.currentTarget as HTMLInputElement).value;
+		lastEmitted = draft.trim() === '' ? undefined : draft;
+		if (lastEmitted !== value) onchange(lastEmitted);
+	}
+
+	function commit() {
+		store.endEdit();
+		editing = false;
+		// Spaces alone are no text: nothing was sent for them, so nothing would
+		// replace them either.
+		if (lastEmitted === undefined) draft = '';
+		baseline = draft;
+		// Leaving a field is what lets its "not filled in yet" show as a problem.
+		if (ref) store.touchField(ref);
+		onblur?.();
+	}
+
+	function onkeydown(event: KeyboardEvent) {
+		if (event.isComposing) return;
+		const key = event.key.toLowerCase();
+		if ((event.ctrlKey || event.metaKey) && (key === 'z' || key === 'y')) {
+			event.preventDefault();
+			event.stopPropagation();
+			commit();
+			if (key === 'y' || event.shiftKey) store.redo();
+			else store.undo();
+		} else if (event.key === 'Escape') {
+			// Only consume Escape while this field is actually editing it; otherwise
+			// it belongs to the surrounding dialog or page (e.g. closing a modal).
+			if (editing) {
+				event.preventDefault();
+				event.stopPropagation();
+				draft = baseline;
+				lastEmitted = baseline.trim() === '' ? undefined : baseline;
+				if (lastEmitted !== value) onchange(lastEmitted);
+				commit();
+			}
+		} else if (event.key === 'Enter' && !multiline) {
+			event.preventDefault();
+			commit();
+		}
+	}
+
+	let issues = $derived(ref ? store.issuesAt(ref) : { errors: [], warnings: [] });
+	const flagged = $derived(invalid || issues.errors.length > 0);
+</script>
+
+<div>
+	{#if multiline}
+		<textarea
+			bind:this={element}
+			value={draft}
+			aria-label={label}
+			aria-describedby={describedby}
+			aria-invalid={flagged || undefined}
+			placeholder={emptyText ?? (placeholder || label)}
+			class="field"
+			class:mono={monospace}
+			class:invalid={flagged}
+			{disabled}
+			rows={3}
+			oninput={input}
+			onfocus={begin}
+			onblur={commit}
+			{onkeydown}></textarea>
+	{:else}
+		<input
+			value={draft}
+			aria-label={label}
+			aria-describedby={describedby}
+			aria-invalid={flagged || undefined}
+			placeholder={emptyText ?? (placeholder || label)}
+			class="field"
+			class:mono={monospace}
+			class:invalid={flagged}
+			class:stand-in={placeholderKind === 'stand-in'}
+			class:compact={density === 'compact'}
+			{disabled}
+			oninput={input}
+			onfocus={begin}
+			onblur={commit}
+			{onkeydown}
+		/>
+	{/if}
+
+	<!-- A line under the field, not a badge: it explains the outline, it is not an alarm. -->
+	{#each issues.errors as error, i (i)}
+		<p class="note error">{error.message}</p>
+	{/each}
+	{#each issues.warnings as warning, i (i)}
+		<p class="note warning">{warning.message}</p>
+	{/each}
+</div>
+
+<style>
+	div {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.field {
+		display: block;
+		box-sizing: border-box;
+		width: 100%;
+		min-width: 0;
+		min-height: 34px;
+		padding: 6px 8px;
+		margin: 0;
+		border: 1px solid transparent;
+		border-bottom-color: var(--e-field-rest-rule);
+		border-radius: var(--radius-xs);
+		background: var(--e-field-rest);
+		font: inherit;
+		color: var(--e-text);
+		resize: vertical;
+		overflow-wrap: anywhere;
+		outline: 0px solid transparent;
+	}
+
+	/* Three rows to start with, then the text decides, up to fourteen. */
+	textarea.field {
+		field-sizing: content;
+		min-height: calc(3lh + 14px);
+		max-height: calc(14lh + 14px);
+	}
+
+	.field.compact {
+		background: none;
+		text-overflow: ellipsis;
+	}
+	.field::placeholder {
+		color: var(--e-text-faint);
+		font-style: italic;
+	}
+	.field.stand-in::placeholder {
+		font-style: normal;
+		opacity: 0.7;
+	}
+	.field:placeholder-shown {
+		border-bottom-style: dashed;
+	}
+	.field:hover:not(:disabled) {
+		background: var(--e-field-hover);
+	}
+	.field:focus {
+		background: var(--surface);
+		border-color: var(--e-focus-ring);
+		outline: 2px solid var(--primary);
+		outline-offset: 0;
+	}
+	.note {
+		margin: 0;
+		padding-left: 8px;
+		font-size: var(--text-xs);
+		line-height: 1.45;
+	}
+	.note.error {
+		color: var(--e-error-text);
+	}
+	.note.warning {
+		color: var(--e-warning-text);
+	}
+	.field.invalid {
+		box-shadow: inset 2px 0 0 var(--e-error);
+	}
+	.field:disabled {
+		background: none;
+		color: var(--e-text-muted);
+	}
+	/*
+	 * --font-code is Fira Code, whose ligatures fold "//" into a single narrow glyph —
+	 * legible in a code editor's dark gutter, but in a plain URL field it reads as one
+	 * slash ("https:/"). A hair of letter-spacing is enough to keep the two strokes
+	 * visually separate without widening the field's own layout or touching the value.
+	 */
+	.mono {
+		font-family: var(--font-code);
+		font-size: var(--text-s);
+		letter-spacing: 0.03em;
+	}
+</style>

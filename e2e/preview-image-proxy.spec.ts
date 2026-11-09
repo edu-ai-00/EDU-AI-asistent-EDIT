@@ -1,0 +1,121 @@
+import { expect, test, openEditor } from './fixtures';
+import { readFileSync } from 'node:fs';
+import { playerBuilt } from './player-build';
+
+/**
+ * The player loads step/solution images through the Laravel API's
+ * `/api/proxy/image` — a proxy that 502s for a number of ordinary image hosts (see
+ * `src/routes/preview-image/+server.ts`'s doc comment). The fix lives entirely in
+ * the editor: `src/lib/preview/player-shim.js`, injected into the player's page
+ * (`vite-plugin-player.ts` in dev, `scripts/inject-player-shim.mjs` in production),
+ * intercepts that request and rewrites it to this origin's own `/preview-image`
+ * before it ever reaches the network.
+ *
+ * This suite needs the Flutter web build, like `preview.spec.ts` — see that file's
+ * comment. It does not depend on any third-party host actually answering: the
+ * assertion is about *which URL the browser asks for*, which is decided before the
+ * request is sent, so it holds even if the (deliberately unresolvable) test image
+ * URL never loads.
+ */
+
+const TEST_IMAGE_URL = 'https://example.com/preview-image-proxy-test.png';
+
+test.describe('the player is rewritten to fetch images from this origin', () => {
+	test.skip(!playerBuilt, 'the Flutter web build is not present');
+	test.describe.configure({ timeout: 150_000 });
+
+	test('a step image request lands on /preview-image, never on the Laravel proxy directly', async ({
+		page
+	}) => {
+		const fixture = JSON.parse(
+			readFileSync(
+				new URL('../src/lib/domain/__tests__/fixtures/spec-16-course.json', import.meta.url),
+				'utf-8'
+			)
+		);
+		const imageStep = fixture.blocks[0].steps.find(
+			(step: { type: string }) => step.type === 'image'
+		);
+		expect(imageStep, 'fixture must still have an image step to redirect').toBeTruthy();
+		imageStep.image.url = TEST_IMAGE_URL;
+
+		const requestUrls: string[] = [];
+		page.on('request', (request) => requestUrls.push(request.url()));
+
+		await openEditor(page);
+		await page.setInputFiles('input[type=file]', {
+			name: 'preview-image-proxy-course.json',
+			mimeType: 'application/json',
+			buffer: Buffer.from(JSON.stringify(fixture))
+		});
+		await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+		// The player announces itself once booted (see preview.spec.ts).
+		await expect(page.locator('aside.preview')).toHaveAttribute('data-player', 'ready', {
+			timeout: 120_000
+		});
+
+		// The first card carries the image step (fixture: L1_B1_uvod / step s2).
+		await page.locator('.tree-card').first().click();
+		// Náhled shows every step at once, so the player fetches the image as soon as
+		// the card is on screen. How soon depends on how busy the machine is — a fixed
+		// three-second wait made this fail whenever the suite ran it alongside another
+		// player — so wait for the request itself.
+		const origin = new URL(page.url()).origin;
+		const encoded = encodeURIComponent(TEST_IMAGE_URL);
+		const rewritten = () =>
+			requestUrls.filter((url) => url.startsWith(`${origin}/preview-image?url=`));
+
+		await expect
+			.poll(() => rewritten().some((url) => url.includes(encoded)), { timeout: 30_000 })
+			.toBe(true);
+		const wentDirectlyToTheLaravelProxy = requestUrls.filter(
+			(url) => url.includes('/api/proxy/image') && !url.startsWith(origin)
+		);
+		expect(wentDirectlyToTheLaravelProxy).toHaveLength(0);
+	});
+
+	test('an image written into a text is fetched through /preview-image as well', async ({
+		page
+	}) => {
+		// The app's Markdown renderer loads `![…](https://…)` straight from its host, which
+		// on the web works only for hosts that send CORS headers.
+		const fixture = JSON.parse(
+			readFileSync(
+				new URL('../src/lib/domain/__tests__/fixtures/spec-16-course.json', import.meta.url),
+				'utf-8'
+			)
+		);
+		const textStep = fixture.blocks[0].steps.find((step: { type: string }) => step.type === 'text');
+		const inline = 'https://example.com/inline-image-test.png';
+		textStep.content = `Kruh: ![Kruh](${inline}) a **text**.`;
+
+		// Only the player's requests: the editor's own text field shows the image too.
+		const requestUrls: string[] = [];
+		page.on('request', (request) => {
+			if (request.frame() !== page.mainFrame()) requestUrls.push(request.url());
+		});
+		await openEditor(page);
+		await page.setInputFiles('input[type=file]', {
+			name: 'inline-image-course.json',
+			mimeType: 'application/json',
+			buffer: Buffer.from(JSON.stringify(fixture))
+		});
+		await expect(page.locator('aside.preview')).toHaveAttribute('data-player', 'ready', {
+			timeout: 120_000
+		});
+		await page.locator('.tree-card').first().click();
+		const origin = new URL(page.url()).origin;
+		await expect
+			.poll(
+				() =>
+					requestUrls.some(
+						(url) =>
+							url.startsWith(`${origin}/preview-image?url=`) &&
+							url.includes(encodeURIComponent(inline))
+					),
+				{ timeout: 30_000 }
+			)
+			.toBe(true);
+		expect(requestUrls.filter((url) => url === inline)).toHaveLength(0);
+	});
+});
